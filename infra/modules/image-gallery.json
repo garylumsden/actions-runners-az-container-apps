@@ -1,0 +1,150 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "4889313723297592336"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "metadata": {
+        "description": "Compute Gallery name. Must be 1-80 chars, alphanumeric + periods/underscores only — no hyphens. Callers must strip hyphens before passing."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "baseName": {
+      "type": "string",
+      "metadata": {
+        "description": "Base name used to derive image-definition offer/sku identifiers (e.g. \"myprefix-gh-runners-REGIONABBR\"). Appears in the image identifier, not a customer-facing name."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/galleries",
+      "apiVersion": "2024-03-03",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "description": "Shared image gallery for self-hosted GitHub Actions VMSS runner tiers."
+      }
+    },
+    {
+      "type": "Microsoft.Compute/galleries/images",
+      "apiVersion": "2024-03-03",
+      "name": "[format('{0}/{1}', parameters('name'), 'gh-runner-ubuntu-2204')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "osType": "Linux",
+        "osState": "Generalized",
+        "hyperVGeneration": "V2",
+        "identifier": {
+          "publisher": "actions-runners-az-container-apps",
+          "offer": "[format('ubuntu-2204-{0}', parameters('baseName'))]",
+          "sku": "gh-runner-ubuntu-2204"
+        },
+        "features": [
+          {
+            "name": "SecurityType",
+            "value": "TrustedLaunch"
+          }
+        ],
+        "recommended": {
+          "vCPUs": {
+            "min": 2,
+            "max": 16
+          },
+          "memory": {
+            "min": 4,
+            "max": 64
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/galleries', parameters('name'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/galleries/images",
+      "apiVersion": "2024-03-03",
+      "name": "[format('{0}/{1}', parameters('name'), 'gh-runner-ws2022')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "osType": "Windows",
+        "osState": "Generalized",
+        "hyperVGeneration": "V2",
+        "identifier": {
+          "publisher": "actions-runners-az-container-apps",
+          "offer": "[format('ws2022-{0}', parameters('baseName'))]",
+          "sku": "gh-runner-ws2022"
+        },
+        "features": [
+          {
+            "name": "SecurityType",
+            "value": "TrustedLaunch"
+          }
+        ],
+        "recommended": {
+          "vCPUs": {
+            "min": 2,
+            "max": 16
+          },
+          "memory": {
+            "min": 4,
+            "max": 64
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/galleries', parameters('name'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "galleryId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries', parameters('name'))]"
+    },
+    "galleryName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "linuxImageDefinitionId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries/images', parameters('name'), 'gh-runner-ubuntu-2204')]"
+    },
+    "linuxImageDefinitionName": {
+      "type": "string",
+      "value": "gh-runner-ubuntu-2204"
+    },
+    "windowsImageDefinitionId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/galleries/images', parameters('name'), 'gh-runner-ws2022')]"
+    },
+    "windowsImageDefinitionName": {
+      "type": "string",
+      "value": "gh-runner-ws2022"
+    }
+  }
+}

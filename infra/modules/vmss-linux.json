@@ -1,0 +1,174 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "13476387806949407752"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "VMSS resource name."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4ds_v5",
+      "metadata": {
+        "description": "VM size. Default Standard_D4ds_v5 — 4 vCPU / 16 GB, supports ephemeral OS on CacheDisk and nested virtualisation."
+      }
+    },
+    "imageReferenceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Compute Gallery image reference ID. Can be a specific image version ID (.../versions/{ver}) or an image-definition ID with the \"latest\" alias used by VMSS to pin the newest version."
+      }
+    },
+    "runnerIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "User-assigned managed identity resource ID for the runner VM (used for ACR pull, Key Vault reads, and self-delete on watchdog expiry)."
+      }
+    },
+    "subnetId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional subnet resource ID to attach each VM NIC to. Empty string means no subnet attached; the VMSS will still be created but cannot reach GitHub until a subnet is wired. MVP supports public-IP-less private deployment only — pass a subnet or accept zero-capacity no-op."
+      }
+    },
+    "maxInstances": {
+      "type": "int",
+      "defaultValue": 10,
+      "minValue": 0,
+      "maxValue": 1000,
+      "metadata": {
+        "description": "Maximum number of instances the scale set may hold. Scaling is driven externally (launcher job); this is only the upper bound."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "runneradmin",
+      "metadata": {
+        "description": "Admin username for the runner VMs. SSH key authentication is enforced (password auth disabled); keys are expected to be baked into the AIB image or provided via adminSshPublicKey."
+      }
+    },
+    "adminSshPublicKey": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional SSH public key for the admin user. When empty, no SSH keys are injected via ARM and authentication is expected to be pre-baked into the AIB image (authorized_keys via cloud-init in the base image). Azure may reject deployment if neither is provided."
+      }
+    },
+    "customDataBase64": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Base64-encoded cloud-init / user-data payload injected as osProfile.customData. Caller is responsible for base64 encoding. Empty default means no customData is set and bootstrap is assumed to be baked into the AIB image."
+      }
+    }
+  },
+  "variables": {
+    "hasSubnet": "[not(empty(parameters('subnetId')))]",
+    "hasSshKey": "[not(empty(parameters('adminSshPublicKey')))]",
+    "sshConfig": {
+      "publicKeys": [
+        {
+          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+          "keyData": "[parameters('adminSshPublicKey')]"
+        }
+      ]
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/virtualMachineScaleSets",
+      "apiVersion": "2024-11-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', parameters('runnerIdentityId'))]": {}
+        }
+      },
+      "sku": {
+        "name": "[parameters('vmSize')]",
+        "capacity": 0
+      },
+      "properties": {
+        "orchestrationMode": "Flexible",
+        "platformFaultDomainCount": 1,
+        "singlePlacementGroup": false,
+        "upgradePolicy": {
+          "mode": "Manual"
+        },
+        "virtualMachineProfile": {
+          "osProfile": {
+            "computerNamePrefix": "ghlnx",
+            "adminUsername": "[parameters('adminUsername')]",
+            "linuxConfiguration": {
+              "disablePasswordAuthentication": true,
+              "ssh": "[if(variables('hasSshKey'), variables('sshConfig'), null())]",
+              "provisionVMAgent": true
+            },
+            "customData": "[if(empty(parameters('customDataBase64')), null(), parameters('customDataBase64'))]"
+          },
+          "storageProfile": {
+            "imageReference": {
+              "id": "[parameters('imageReferenceId')]"
+            },
+            "osDisk": {
+              "createOption": "FromImage",
+              "caching": "ReadOnly",
+              "diffDiskSettings": {
+                "option": "Local",
+                "placement": "CacheDisk"
+              }
+            }
+          },
+          "securityProfile": {
+            "securityType": "TrustedLaunch",
+            "uefiSettings": {
+              "secureBootEnabled": true,
+              "vTpmEnabled": true
+            }
+          },
+          "networkProfile": "[if(variables('hasSubnet'), createObject('networkApiVersion', '2022-11-01', 'networkInterfaceConfigurations', createArray(createObject('name', format('{0}-nic', parameters('name')), 'properties', createObject('primary', true(), 'ipConfigurations', createArray(createObject('name', 'ipconfig1', 'properties', createObject('subnet', createObject('id', parameters('subnetId')), 'primary', true()))))))), null())]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "vmssId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('name'))]"
+    },
+    "vmssName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "maxInstances": {
+      "type": "int",
+      "value": "[parameters('maxInstances')]"
+    }
+  }
+}

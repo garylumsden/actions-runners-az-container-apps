@@ -1,0 +1,20 @@
+# Azure Developer CLI configuration
+.azure/
+
+# Bicep compiled output
+*.json.bicep
+infra/*.json
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+!.vscode/extensions.json
+.idea/

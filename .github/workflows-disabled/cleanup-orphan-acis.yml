@@ -1,0 +1,156 @@
+name: Cleanup Orphan Windows ACI Runners
+
+# Reaps ACI container groups named aci-win-runner-* that the Windows launcher
+# (docker/windows-launcher/entrypoint.sh) failed to delete on exit. Backstop
+# for the launcher's cleanup trap — if the launcher's ARM delete silently
+# fails (throttling, 5xx, auth), this GC catches the orphan within ~1h and
+# stops unnecessary ACI billing.
+#
+# An ACI is eligible for deletion when ALL of:
+#   - name starts with 'aci-win-runner-'
+#   - every container in the group is in state 'Terminated'
+#   - the most recent finishTime (or provisioning state timestamp fallback)
+#     is more than 2h old — avoids racing with an in-flight launcher whose
+#     polling loop is still between iterations.
+
+on:
+  # Scheduled run disabled — job kept available for manual dispatch only.
+  # schedule:
+  #   # Hourly at :07 to offset from other scheduled jobs and reduce API contention.
+  #   - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run only (list, do not delete)'
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # OIDC token exchange with Azure
+  contents: read
+
+# One GC run at a time — don't pile up deletes against ARM.
+concurrency:
+  group: cleanup-orphan-acis
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Reap orphan ACI runners
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Reap orphan ACI groups
+        env:
+          RG: ${{ vars.RESOURCE_GROUP }}
+          # Scheduled runs always delete. workflow_dispatch respects the input
+          # (default true = dry-run) so humans can inspect before actioning.
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+          AGE_THRESHOLD_SECONDS: '7200'  # 2h
+        run: |
+          set -euo pipefail
+
+          echo "Resource group: ${RG}"
+          echo "Dry-run:        ${DRY_RUN}"
+          echo "Age threshold:  ${AGE_THRESHOLD_SECONDS}s"
+
+          NOW=$(date -u +%s)
+
+          # Pull full instanceView so we can read container state + finishTime.
+          GROUPS_JSON=$(az container list \
+            --resource-group "${RG}" \
+            --output json)
+
+          # Filter to aci-win-runner-* groups where every container is Terminated
+          # and the latest finishTime (fall back to empty for pre-run groups) is
+          # older than the threshold. Using jq for deterministic parsing —
+          # az --query JMESPath can't do the AND-across-array-elements check cleanly.
+          ORPHANS=$(echo "${GROUPS_JSON}" | jq -r --argjson now "${NOW}" --argjson threshold "${AGE_THRESHOLD_SECONDS}" '
+            [ .[]
+              | select(.name | startswith("aci-win-runner-"))
+              | select(.containers | length > 0)
+              | select(all(.containers[]; .instanceView.currentState.state == "Terminated"))
+              | . as $g
+              | ($g.containers | map(.instanceView.currentState.finishTime) | map(select(. != null)) | sort | last) as $finish
+              | ($finish // $g.containers[0].instanceView.currentState.startTime // "") as $ts
+              | select($ts != "")
+              | select((($ts | fromdateiso8601) + $threshold) < $now)
+              | {name: $g.name, finishTime: $finish, ageSeconds: ($now - ($ts | fromdateiso8601)), exitCode: $g.containers[0].instanceView.currentState.exitCode}
+            ]')
+
+          COUNT=$(echo "${ORPHANS}" | jq 'length')
+          echo "Found ${COUNT} orphan ACI group(s) eligible for reap."
+
+          # Build step-summary table header.
+          {
+            echo "## Orphan ACI Cleanup"
+            echo ""
+            echo "- Resource group: \`${RG}\`"
+            echo "- Dry-run: \`${DRY_RUN}\`"
+            echo "- Age threshold: ${AGE_THRESHOLD_SECONDS}s"
+            echo "- Orphans found: **${COUNT}**"
+            echo ""
+            echo "| Name | Exit | Finish time | Age (s) | Action | Result |"
+            echo "|------|------|-------------|---------|--------|--------|"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${COUNT}" -eq 0 ]]; then
+            echo "| _none_ | - | - | - | - | - |" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          FAIL=0
+          echo "${ORPHANS}" | jq -c '.[]' | while IFS= read -r row; do
+            NAME=$(echo "${row}"     | jq -r '.name')
+            EXIT_CODE=$(echo "${row}" | jq -r '.exitCode // "?"')
+            FINISH=$(echo "${row}"   | jq -r '.finishTime // ""')
+            AGE=$(echo "${row}"      | jq -r '.ageSeconds')
+
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "[dry-run] would delete ${NAME} (exit=${EXIT_CODE}, finish=${FINISH}, age=${AGE}s)"
+              echo "| \`${NAME}\` | ${EXIT_CODE} | ${FINISH} | ${AGE} | dry-run | would delete |" >> "${GITHUB_STEP_SUMMARY}"
+              continue
+            fi
+
+            echo "Deleting ${NAME} (exit=${EXIT_CODE}, finish=${FINISH}, age=${AGE}s)..."
+            # Blocking delete (no --no-wait) so we know ARM accepted it before moving on.
+            # Surface stderr for visibility — do NOT silently mask errors as the
+            # launcher previously did (that is the bug this GC backstops).
+            if delete_stderr=$(az container delete \
+                --resource-group "${RG}" \
+                --name           "${NAME}" \
+                --yes \
+                --output none 2>&1 >/dev/null); then
+              echo "Deleted ${NAME}"
+              echo "| \`${NAME}\` | ${EXIT_CODE} | ${FINISH} | ${AGE} | delete | ✅ deleted |" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              rc=$?
+              echo "::error::Failed to delete ${NAME} (rc=${rc}): ${delete_stderr}"
+              echo "| \`${NAME}\` | ${EXIT_CODE} | ${FINISH} | ${AGE} | delete | ❌ failed (rc=${rc}) |" >> "${GITHUB_STEP_SUMMARY}"
+              FAIL=1
+            fi
+          done
+
+          # Note: FAIL set inside the pipe subshell above does not propagate,
+          # so re-check by grepping the summary for a failure marker.
+          if grep -q '❌ failed' "${GITHUB_STEP_SUMMARY}"; then
+            echo "::error::One or more deletes failed — see step summary."
+            exit 1
+          fi

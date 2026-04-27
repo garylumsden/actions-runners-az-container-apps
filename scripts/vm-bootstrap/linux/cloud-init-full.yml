@@ -1,0 +1,154 @@
+#cloud-config
+# Self-contained cloud-init for VMSS Linux runners.
+#
+# The baked AIB image is minimal (docker, jq, curl, git, python3). This
+# cloud-init lays down everything else on first boot:
+#   - azure-cli (needed by bootstrap.sh to read KV secret, and by watchdog.sh
+#     to self-delete)
+#   - the actions-runner binary (pulled from github.com/actions/runner/releases)
+#   - /opt/gh-runner-bootstrap/{bootstrap,watchdog}.sh and hooks
+#   - systemd units gh-runner.service + gh-runner-watchdog.{service,timer}
+#   - the ghrunner user
+#
+# Script bodies are injected at deploy time by infra/main.bicep via
+# replace() + base64() of the on-disk files under scripts/vm-bootstrap/linux/.
+# The __*__B64__ markers are placeholders the Bicep build fills in; cloud-init
+# then base64-decodes each file (encoding: b64) into the target path.
+
+groups:
+  - ghrunner
+  - docker
+
+users:
+  - name: ghrunner
+    primary_group: ghrunner
+    groups: [docker]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo:
+      - "ALL=(root) NOPASSWD: /sbin/shutdown"
+
+write_files:
+  - path: /opt/gh-runner-bootstrap/bootstrap.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: __BOOTSTRAP_SH_B64__
+
+  - path: /opt/gh-runner-bootstrap/watchdog.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: __WATCHDOG_SH_B64__
+
+  - path: /opt/gh-runner-bootstrap/hooks/job-started.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: __HOOK_STARTED_SH_B64__
+
+  - path: /opt/gh-runner-bootstrap/hooks/job-completed.sh
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: __HOOK_COMPLETED_SH_B64__
+
+  - path: /etc/systemd/system/gh-runner.service
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: __GH_RUNNER_SERVICE_B64__
+
+  - path: /etc/systemd/system/gh-runner-watchdog.service
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: __GH_RUNNER_WATCHDOG_SERVICE_B64__
+
+  - path: /etc/systemd/system/gh-runner-watchdog.timer
+    permissions: '0644'
+    owner: root:root
+    encoding: b64
+    content: __GH_RUNNER_WATCHDOG_TIMER_B64__
+
+  - path: /opt/gh-runner-bootstrap/firstboot.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      # First-boot provisioning for a VMSS Linux runner VM. Idempotent: records
+      # completion via a marker file so cloud-init re-runs (rare) are no-ops.
+      set -euo pipefail
+
+      LOG=/var/log/gh-runner-firstboot.log
+      exec > >(tee -a "$LOG") 2>&1
+
+      log() { printf '[firstboot] %s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+      if [ -f /opt/gh-runner-bootstrap/.firstboot-done ]; then
+        log "already done; exiting"
+        exit 0
+      fi
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      log "apt update + base deps"
+      apt-get update -y
+      apt-get install -y curl gpg jq ca-certificates tar sudo gnupg
+
+      if ! command -v az >/dev/null 2>&1; then
+        log "installing azure-cli from packages.microsoft.com"
+        mkdir -p /etc/apt/keyrings
+        curl -sLS https://packages.microsoft.com/keys/microsoft.asc \
+          | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+        chmod go+r /etc/apt/keyrings/microsoft.gpg
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ ${VERSION_CODENAME} main" \
+          > /etc/apt/sources.list.d/azure-cli.list
+        apt-get update -y
+        apt-get install -y azure-cli
+      else
+        log "azure-cli already present"
+      fi
+
+      if [ ! -x /actions-runner/config.sh ]; then
+        log "fetching latest actions/runner release metadata"
+        RUNNER_JSON=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest)
+        TARBALL_URL=$(echo "$RUNNER_JSON" \
+          | jq -r '.assets[] | select(.name | test("actions-runner-linux-x64-.*\\.tar\\.gz$")) | .browser_download_url' \
+          | head -n1)
+        if [ -z "$TARBALL_URL" ] || [ "$TARBALL_URL" = "null" ]; then
+          log "FATAL: could not resolve runner tarball URL"
+          exit 1
+        fi
+        log "downloading $TARBALL_URL"
+        mkdir -p /actions-runner
+        cd /actions-runner
+        curl -fsSLo runner.tar.gz "$TARBALL_URL"
+        tar -xzf runner.tar.gz
+        rm -f runner.tar.gz
+        chown -R ghrunner:ghrunner /actions-runner
+        log "installing runner OS dependencies"
+        ./bin/installdependencies.sh || log "WARNING: installdependencies.sh failed (continuing)"
+      else
+        log "runner already installed at /actions-runner"
+      fi
+
+      log "lifecycle directories"
+      install -d -m 0755 -o ghrunner -g ghrunner /var/run/runner-lifecycle
+      # /etc/gh-runner is ghrunner-writable so bootstrap.sh (User=ghrunner)
+      # can write lifecycle.env on first boot. The watchdog runs as root and
+      # only reads this file, so group/other-readable 0755 is fine.
+      install -d -m 0755 -o ghrunner -g ghrunner /etc/gh-runner
+
+      log "enabling systemd units"
+      systemctl daemon-reload
+      systemctl enable --now gh-runner-watchdog.timer
+      systemctl enable --now gh-runner.service
+
+      touch /opt/gh-runner-bootstrap/.firstboot-done
+      log "firstboot complete"
+
+runcmd:
+  - [/opt/gh-runner-bootstrap/firstboot.sh]

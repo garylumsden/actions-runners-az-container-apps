@@ -1,0 +1,149 @@
+name: Build & Push Runner Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/build-images.yml'
+  # Scheduled run disabled — manual dispatch only.
+  # Weekly base-image refresh — Sunday 22:00 UTC (10 pm GMT / 11 pm BST).
+  # schedule:
+  #   - cron: '0 22 * * 0'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+# Only one build per image at a time; a newer run cancels any in-progress one.
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build images
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: ${{ matrix.timeout }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-runner
+            context: docker/linux
+            image: github-runner-linux
+            platform: linux
+            timeout: 30
+          - name: windows-launcher
+            context: docker/windows-launcher
+            image: windows-runner-launcher
+            platform: linux
+            timeout: 30
+          - name: vmss-launcher
+            context: docker/vmss-launcher
+            image: vmss-launcher
+            platform: linux
+            timeout: 30
+          - name: windows-runner
+            context: docker/windows-runner
+            image: github-runner-windows
+            platform: windows
+            timeout: 45
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Discover the ACR name from Azure — no need to store it as a variable.
+      - name: Discover ACR name
+        id: acr
+        run: |
+          ACR_NAME=$(az acr list \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --query "[0].name" \
+            --output tsv)
+          # Mask the value before any later echo or validation message can print it.
+          echo "::add-mask::${ACR_NAME}"
+          if [[ -z "$ACR_NAME" ]]; then
+            echo "::error::No ACR found in resource group '${{ vars.RESOURCE_GROUP }}' (wrong subscription or RBAC issue?)"
+            exit 1
+          fi
+          if [[ ! "$ACR_NAME" =~ ^cr[a-z0-9]+$ ]]; then
+            echo "::error::Discovered ACR name does not match expected pattern ^cr[a-z0-9]+$"
+            exit 1
+          fi
+          echo "name=${ACR_NAME}" >> "$GITHUB_OUTPUT"
+
+      # Generate date-based tags.
+      # Code pushes get:  YYYYMMDD-<sha7>  +  stable  (SHA makes the tag immutable)
+      # Other triggers get:  YYYYMMDD-HHmm  +  stable  (minute-precision tag is immutable within a build)
+      # 'stable' is a mutable pointer used by ACA job definitions so they
+      # always run the newest image without needing a Bicep re-deploy.
+      # The bare YYYYMMDD tag is intentionally NOT pushed — it looks immutable
+      # but would be silently clobbered by any same-day rebuild, breaking rollback traceability.
+      # ':latest' is also intentionally never pushed.
+      - name: Generate image tags
+        id: tags
+        run: |
+          DATE=$(date -u '+%Y%m%d')
+          DATETIME=$(date -u '+%Y%m%d-%H%M')
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tags=${{ matrix.image }}:${DATE}-${SHORT_SHA} ${{ matrix.image }}:stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${{ matrix.image }}:${DATETIME} ${{ matrix.image }}:stable" >> "$GITHUB_OUTPUT"
+          fi
+
+      # az acr build runs the Docker build in the cloud using ACR Tasks —
+      # no local Docker daemon required; the managed identity on the ACR handles push auth.
+      # Windows images require --platform windows to use a Windows build agent.
+      # Retry up to 3 times with exponential backoff to ride out transient ACR/network failures.
+      - name: Build and push ${{ matrix.name }}
+        run: |
+          IMAGE_FLAGS=""
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            IMAGE_FLAGS="$IMAGE_FLAGS --image $tag"
+          done
+
+          attempt=1
+          max_attempts=3
+          delay=30
+          while : ; do
+            echo "::group::az acr build attempt ${attempt}/${max_attempts}"
+            if az acr build \
+                --registry        ${{ steps.acr.outputs.name }} \
+                --resource-group  ${{ vars.RESOURCE_GROUP }} \
+                --platform        ${{ matrix.platform }} \
+                $IMAGE_FLAGS \
+                ${{ matrix.context }}; then
+              echo "::endgroup::"
+              echo "Build succeeded on attempt ${attempt}."
+              break
+            fi
+            echo "::endgroup::"
+            if (( attempt >= max_attempts )); then
+              echo "::error::az acr build failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "::warning::az acr build failed (attempt ${attempt}); retrying in ${delay}s"
+            sleep "$delay"
+            attempt=$(( attempt + 1 ))
+            delay=$(( delay * 2 ))
+          done

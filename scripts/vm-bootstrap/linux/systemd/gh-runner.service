@@ -1,0 +1,21 @@
+[Unit]
+Description=GitHub Actions self-hosted runner (VMSS bootstrap)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/gh-runner-bootstrap/bootstrap.sh
+
+[Service]
+Type=simple
+User=ghrunner
+Group=ghrunner
+WorkingDirectory=/actions-runner
+ExecStart=/opt/gh-runner-bootstrap/bootstrap.sh
+# The runner exits 0 on graceful shutdown and non-zero on failure.
+# We don't auto-restart: the watchdog owns lifecycle and the VMSS scaler owns replacement.
+Restart=no
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target

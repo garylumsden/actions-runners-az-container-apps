@@ -1,0 +1,8 @@
+name: actions-runners-az-container-apps
+
+services: {}
+
+infra:
+  provider: bicep
+  path: infra
+  module: main

@@ -1,0 +1,96 @@
+#cloud-config
+# VMSS customData for Linux GitHub Actions runner VMs.
+# The heavy lifting (runner binary, jq, az-cli) is baked into the image by AIB.
+# This cloud-init only lays down lifecycle state, systemd units, and the runner user.
+
+users:
+  - name: ghrunner
+    groups: [docker]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo:
+      - "ALL=(root) NOPASSWD: /sbin/shutdown"
+
+write_files:
+  - path: /opt/gh-runner-bootstrap/bootstrap.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #PLACEHOLDER -- replaced at image-bake time by AIB customiser that copies
+      # scripts/vm-bootstrap/linux/bootstrap.sh into place. This cloud-init is
+      # intentionally a thin shim: the real scripts live on the baked image so
+      # they can be reviewed, linted, and updated via AIB template revisions
+      # rather than customData rewrites.
+      exec /opt/gh-runner-bootstrap/bootstrap.sh.real "$@"
+
+  # The actual scripts are written by the AIB customiser to the ".real" paths
+  # below. Systemd units reference /opt/gh-runner-bootstrap/{bootstrap,watchdog}.sh,
+  # which are symlinked to the .real copies during image bake. This block is the
+  # canonical list of files the baked image MUST provide:
+  #   /opt/gh-runner-bootstrap/bootstrap.sh
+  #   /opt/gh-runner-bootstrap/watchdog.sh
+  #   /opt/gh-runner-bootstrap/hooks/job-started.sh
+  #   /opt/gh-runner-bootstrap/hooks/job-completed.sh
+
+  - path: /etc/systemd/system/gh-runner.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=GitHub Actions self-hosted runner (VMSS bootstrap)
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/opt/gh-runner-bootstrap/bootstrap.sh
+
+      [Service]
+      Type=simple
+      User=ghrunner
+      Group=ghrunner
+      WorkingDirectory=/actions-runner
+      ExecStart=/opt/gh-runner-bootstrap/bootstrap.sh
+      Restart=no
+      KillMode=process
+      KillSignal=SIGTERM
+      TimeoutStopSec=5min
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/gh-runner-watchdog.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=GitHub Actions runner idle/lifetime watchdog
+      ConditionPathExists=/opt/gh-runner-bootstrap/watchdog.sh
+
+      [Service]
+      Type=oneshot
+      User=root
+      ExecStart=/opt/gh-runner-bootstrap/watchdog.sh
+
+  - path: /etc/systemd/system/gh-runner-watchdog.timer
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Periodic trigger for gh-runner-watchdog.service
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=60s
+      AccuracySec=10s
+      Unit=gh-runner-watchdog.service
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - [install, -d, -m, '0755', -o, ghrunner, -g, ghrunner, /var/run/runner-lifecycle]
+  # /etc/gh-runner is ghrunner-writable so bootstrap.sh (User=ghrunner) can
+  # write lifecycle.env on first boot. The watchdog runs as root and only
+  # reads this file, so group/other-readable 0755 is fine.
+  - [install, -d, -m, '0755', -o, ghrunner, -g, ghrunner, /etc/gh-runner]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, gh-runner-watchdog.timer]
+  - [systemctl, enable, --now, gh-runner.service]

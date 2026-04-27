@@ -1,0 +1,1117 @@
+name: Test Runners
+
+# Exercises each runner tier end-to-end. Four tiers:
+#   - aca-linux        (KEDA ACA Job, Linux container)
+#   - aci-windows      (KEDA ACA launcher that creates a Windows ACI)
+#   - vmss-linux       (opt-in; VMSS with warm pool + idle retention)
+#   - vmss-windows     (opt-in; VMSS with warm pool + idle retention)
+#
+# For the two VMSS tiers the workflow validates THREE variants per OS:
+#   - warm        — two-job chain asserts witness file survives between
+#                   runs (proves the same VM was reused), then teardown
+#                   asserts the VM is gone after retention expires.
+#   - ephemeral   — single job runs on a retention=0 deployment, then a
+#                   post-check asserts the instance no longer exists (new
+#                   VM per job; `--ephemeral` registration + self-delete).
+#   - max-lifetime (opt-in, long-running) — asserts the hard age cap
+#                   recycles a VM even when jobs keep arriving.
+#
+# Tier isolation: each variant is tagged with a unique TEST_LABEL of the
+# form `test-<run-id>-<os>-<variant>`. Witness file names include the
+# label, runner hostnames are collected per-variant and used to scope
+# leak detection — so concurrent test runs and warm-pool minimums do not
+# cross-contaminate. Since fix #99, the label suffix is also plumbed
+# through to the Bicep deploy via `vmssRunnerLabelSuffix`, so the KEDA
+# scaler filter AND the runner `--labels` registration both include the
+# per-variant suffix. That means `runs-on:` can include the suffix for
+# hard dispatch-layer isolation (no longer just a teardown-time assertion).
+#
+# The workflow drives `az deployment group create` itself per variant,
+# so the warm / ephemeral / max-lifetime infra shapes are actually
+# exercised — warm_retention_minutes and max_lifetime_hours are
+# forwarded through to the Bicep deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Which tier to test'
+        type: choice
+        options:
+          - all
+          - aca-linux
+          - aci-windows
+          - vmss-linux
+          - vmss-windows
+        default: all
+      enable_vmss_linux:
+        description: 'Run the vmss-linux variants (must match deployed infra).'
+        type: boolean
+        default: false
+      enable_vmss_windows:
+        description: 'Run the vmss-windows variants (must match deployed infra).'
+        type: boolean
+        default: false
+      warm_retention_minutes:
+        description: 'VMSS idle retention used for the warm-variant test (keep short for CI; 3 = default).'
+        type: number
+        default: 3
+      max_lifetime_hours:
+        description: 'VMSS hard recycle cap in hours (used as fallback when max_lifetime_minutes is 0).'
+        type: number
+        default: 1
+      max_lifetime_minutes:
+        description: 'VMSS hard recycle cap in minutes (#100). When >0 overrides max_lifetime_hours in the watchdog — lets the max-lifetime variant exercise the cap in <1h of wall clock. Default 3.'
+        type: number
+        default: 3
+      run_max_lifetime_variant:
+        description: 'Run the max-lifetime variant (~max_lifetime_minutes + 5m when minutes>0, else max_lifetime_hours + 5m).'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'scripts/vm-bootstrap/**'
+      - 'infra/**'
+      - '.github/workflows/*.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: test-runners-${{ github.ref }}
+  cancel-in-progress: true
+
+# Common per-run label prefix used for witness file names, VMSS instance
+# tagging, and teardown hostname scoping.
+env:
+  TEST_LABEL_PREFIX: test-${{ github.run_id }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Tier 1: aca-linux  (existing smoke test)
+  # ────────────────────────────────────────────────────────────────────
+  test-aca-linux:
+    name: Smoke — aca-linux
+    if: ${{ github.event_name == 'push' || inputs.tier == 'all' || inputs.tier == 'aca-linux' }}
+    runs-on: [self-hosted, linux, aca]
+    timeout-minutes: 15
+    steps:
+      - name: Runner identity
+        run: |
+          echo "Hostname : $(hostname)"
+          echo "Kernel   : $(uname -sr)"
+          echo "User     : $(whoami)"
+          echo "PWD      : $PWD"
+      - name: Tooling present
+        run: |
+          set -e
+          for t in git curl jq docker; do
+            printf "%-8s " "$t"; command -v "$t" && "$t" --version 2>&1 | head -n1 || echo "MISSING"
+          done
+      - name: Network reachability
+        run: curl -fsS -o /dev/null -w '%{http_code}\n' https://api.github.com || true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Workspace write
+        run: |
+          echo "hello from aca-linux $(date -u +%FT%TZ)" > smoke.txt
+          cat smoke.txt
+
+  # ────────────────────────────────────────────────────────────────────
+  # Tier 2: aci-windows  (existing smoke test)
+  # ────────────────────────────────────────────────────────────────────
+  test-aci-windows:
+    name: Smoke — aci-windows
+    if: ${{ github.event_name == 'push' || inputs.tier == 'all' || inputs.tier == 'aci-windows' }}
+    runs-on: [self-hosted, windows, aci]
+    timeout-minutes: 20
+    steps:
+      - name: Runner identity
+        shell: pwsh
+        run: |
+          Write-Host "Hostname : $env:COMPUTERNAME"
+          Write-Host "OS       : $([Environment]::OSVersion.VersionString)"
+          Write-Host "PSVer    : $($PSVersionTable.PSVersion)"
+          Write-Host "User     : $env:USERNAME"
+      - name: Tooling present
+        shell: pwsh
+        run: |
+          foreach ($t in 'git','curl.exe','pwsh','dotnet') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            if ($c) { "$t`t$($c.Source)" } else { "$t`tMISSING" }
+          }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Workspace write
+        shell: pwsh
+        run: |
+          "hello from aci-windows $(Get-Date -Format o)" | Out-File smoke.txt
+          Get-Content smoke.txt
+
+  # ────────────────────────────────────────────────────────────────────
+  # Tier 3: vmss-linux
+  # ────────────────────────────────────────────────────────────────────
+
+  # Deploy the warm-shape infra (retention=warm_retention_minutes, lifetime=default)
+  # before running the warm-variant chain. Forwards warm_retention_minutes through
+  # to Bicep so the infra actually matches the variant under test.
+  vmss-linux-warm-deploy:
+    name: vmss-linux warm — deploy infra
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    outputs:
+      test_label: ${{ steps.label.outputs.value }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Compute TEST_LABEL
+        id: label
+        run: echo "value=${TEST_LABEL_PREFIX}-linux-warm" >> "$GITHUB_OUTPUT"
+      - name: Deploy infra (retention=warm_retention_minutes)
+        run: |
+          set -euo pipefail
+          # Generate a throwaway SSH keypair — private key discarded, public key
+          # masked and passed to Bicep. Never stored.
+          KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+          ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+          SSH_KEY="$(cat "${KEYFILE}.pub")"
+          echo "::add-mask::${SSH_KEY}"
+          rm -f "${KEYFILE}" "${KEYFILE}.pub"
+          az deployment group create \
+            --name "test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             enableVmssLinux=true \
+                             enableVmssWindows=${{ inputs.enable_vmss_windows }} \
+                             enableAibUbuntu=false \
+                             enableAibWindows=false \
+                             vmssLinuxAdminSshPublicKey="$SSH_KEY" \
+                             vmssLinuxIdleRetentionMinutes=${{ inputs.warm_retention_minutes || 3 }} \
+                             vmssLinuxMaxLifetimeHours=12 \
+                             vmssRunnerLabelSuffix='${{ steps.label.outputs.value }}' \
+            --output none
+      - name: Recycle stale launcher executions (label-reimage gap)
+        # After redeploy, launcher ACA Job executions started by the *previous*
+        # vmssRunnerLabelSuffix keep running with their old RUNNER_LABELS env.
+        # KEDA's github-runner scaler then sees current parallelism >= queue
+        # depth (because of stale execs) and refuses to scale up new replicas
+        # under the new label, deadlocking the next test run until idle
+        # retention drains them. Explicitly stop those stale execs and wait
+        # for ACA to mark them terminal so KEDA's parallelism count drops to 0.
+        env:
+          OS_PREFIX: lnx
+          RG: ${{ vars.RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          LAUNCHER=$(az containerapp job list -g "$RG" \
+            --query "[?starts_with(name, 'caj-vmss-${OS_PREFIX}-launcher-')].name | [0]" -o tsv)
+          if [[ -z "$LAUNCHER" || "$LAUNCHER" == "null" ]]; then
+            echo "No ${OS_PREFIX} launcher Job found — nothing to recycle"
+            exit 0
+          fi
+          echo "Launcher: $LAUNCHER"
+          # Non-terminal ACA Job execution states.
+          QUERY="[?properties.status=='Running' || properties.status=='Pending' || properties.status=='Processing'].name"
+          EXECS=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+          if [[ -z "$EXECS" ]]; then
+            echo "No active executions to recycle"
+            exit 0
+          fi
+          EXEC_LIST=$(echo "$EXECS" | tr '\n' ',' | sed 's/,$//')
+          echo "Stopping stale executions: $EXEC_LIST"
+          az containerapp job stop -g "$RG" -n "$LAUNCHER" --execution-name-list "$EXEC_LIST" --output none || true
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            LEFT=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+            if [[ -z "$LEFT" ]]; then
+              echo "All stale executions drained"
+              break
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "::warning::Timed out after 5min waiting for executions to drain: $(echo "$LEFT" | tr '\n' ' ')"
+              break
+            fi
+            echo "Still active: $(echo "$LEFT" | tr '\n' ' ') — waiting 10s..."
+            sleep 10
+          done
+
+  vmss-linux-warm-run-1:
+    name: vmss-linux warm — run 1 (write witness)
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux }}
+    needs: vmss-linux-warm-deploy
+    runs-on: [self-hosted, linux, vmss, "${{ needs.vmss-linux-warm-deploy.outputs.test_label }}"]
+    timeout-minutes: 15
+    outputs:
+      uuid: ${{ steps.witness.outputs.uuid }}
+      hostname: ${{ steps.witness.outputs.hostname }}
+    steps:
+      - name: Tier capability smoke (docker)
+        run: |
+          set -euo pipefail
+          echo "docker version:"; docker --version
+          docker run --rm hello-world
+      - name: Write witness
+        id: witness
+        env:
+          TEST_LABEL: ${{ needs.vmss-linux-warm-deploy.outputs.test_label }}
+        run: |
+          set -euo pipefail
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          HN=$(hostname)
+          # Use $HOME (not /var/tmp) — the job-completed cleanup hook wipes
+          # /var/tmp between jobs for security (issue #90). $HOME persists
+          # across warm-reuse jobs (only specific dotfiles + _work are wiped).
+          WITNESS="$HOME/warm-witness-${TEST_LABEL}"
+          printf '%s %s\n' "$UUID" "$HN" > "$WITNESS"
+          echo "Witness: $WITNESS"
+          cat "$WITNESS"
+          echo "uuid=$UUID"      >> "$GITHUB_OUTPUT"
+          echo "hostname=$HN"    >> "$GITHUB_OUTPUT"
+
+  vmss-linux-warm-run-2:
+    name: vmss-linux warm — run 2 (assert same VM)
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux }}
+    needs: [vmss-linux-warm-deploy, vmss-linux-warm-run-1]
+    runs-on: [self-hosted, linux, vmss, "${{ needs.vmss-linux-warm-deploy.outputs.test_label }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Verify witness
+        env:
+          TEST_LABEL: ${{ needs.vmss-linux-warm-deploy.outputs.test_label }}
+          EXPECTED_UUID: ${{ needs.vmss-linux-warm-run-1.outputs.uuid }}
+          EXPECTED_HOST: ${{ needs.vmss-linux-warm-run-1.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          WITNESS="$HOME/warm-witness-${TEST_LABEL}"
+          ACTUAL_HOST=$(hostname)
+          if [[ ! -f "$WITNESS" ]]; then
+            echo "::error title=Warm retention broken::Witness $WITNESS not found on $ACTUAL_HOST (cold VM — run-1 ran on $EXPECTED_HOST)"
+            exit 1
+          fi
+          read -r GOT_UUID GOT_HOST < "$WITNESS"
+          if [[ "$GOT_UUID" != "$EXPECTED_UUID" || "$GOT_HOST" != "$EXPECTED_HOST" || "$ACTUAL_HOST" != "$EXPECTED_HOST" ]]; then
+            echo "::error title=Warm retention broken::Witness mismatch. expected=$EXPECTED_UUID/$EXPECTED_HOST got=$GOT_UUID/$GOT_HOST actual=$ACTUAL_HOST"
+            exit 1
+          fi
+          echo "OK — warm VM reused: $ACTUAL_HOST"
+
+  vmss-linux-warm-teardown-check:
+    name: vmss-linux warm — teardown check
+    if: ${{ always() && (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux && needs.vmss-linux-warm-run-1.result != 'skipped' }}
+    needs: [vmss-linux-warm-deploy, vmss-linux-warm-run-1, vmss-linux-warm-run-2]
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Wait for retention + watchdog + grace
+        run: |
+          RET=${{ inputs.warm_retention_minutes || 3 }}
+          SLEEP=$(( RET * 60 + 120 ))
+          echo "Sleeping ${SLEEP}s (retention ${RET}m + 2m grace)…"
+          sleep "$SLEEP"
+      - name: Assert test-run VM no longer exists
+        env:
+          WITNESS_HOST: ${{ needs.vmss-linux-warm-run-1.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WITNESS_HOST" ]]; then
+            echo "::error::No witness hostname from run-1; cannot scope leak check"
+            exit 1
+          fi
+          VMSS=$(az vmss list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'vmss-lnx-')] | [0].name" \
+            -o tsv)
+          if [[ -z "$VMSS" || "$VMSS" == "None" ]]; then
+            echo "::error::No vmss-lnx-* scale set found in ${{ vars.RESOURCE_GROUP }}"
+            exit 1
+          fi
+          LEAKED=$(az vmss list-instances \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" \
+            --query "[?osProfile.computerName=='${WITNESS_HOST}'] | length(@)" -o tsv)
+          echo "Instances matching witness host ${WITNESS_HOST}: $LEAKED"
+          if [[ "$LEAKED" != "0" ]]; then
+            echo "::error title=Watchdog failed::Test-run VM '${WITNESS_HOST}' still present after retention expiry"
+            exit 1
+          fi
+      # Note: a runner-leak check via `gh api /repos/.../actions/runners`
+      # would require `administration: read` — not a valid GITHUB_TOKEN
+      # permission in workflow YAML. GitHub garbage-collects orphaned
+      # offline runners within ~24h, and the VM-leak check above already
+      # catches the real failure (watchdog didn't self-delete the VM).
+
+  # Ephemeral variant: redeploy with retention=0, run a single job, verify
+  # the VM that ran it has been torn down (ephemeral registration +
+  # self-delete). Runs AFTER the warm chain so we do not re-shape the
+  # infra out from under the warm tests.
+  vmss-linux-ephemeral-deploy:
+    name: vmss-linux ephemeral — deploy infra
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux }}
+    needs: vmss-linux-warm-teardown-check
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    outputs:
+      test_label: ${{ steps.label.outputs.value }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Compute TEST_LABEL
+        id: label
+        run: echo "value=${TEST_LABEL_PREFIX}-linux-ephemeral" >> "$GITHUB_OUTPUT"
+      - name: Deploy infra (retention=0)
+        run: |
+          set -euo pipefail
+          KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+          ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+          SSH_KEY="$(cat "${KEYFILE}.pub")"
+          echo "::add-mask::${SSH_KEY}"
+          rm -f "${KEYFILE}" "${KEYFILE}.pub"
+          az deployment group create \
+            --name "test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             enableVmssLinux=true \
+                             enableVmssWindows=${{ inputs.enable_vmss_windows }} \
+                             enableAibUbuntu=false \
+                             enableAibWindows=false \
+                             vmssLinuxAdminSshPublicKey="$SSH_KEY" \
+                             vmssLinuxIdleRetentionMinutes=0 \
+                             vmssLinuxMaxLifetimeHours=12 \
+                             vmssRunnerLabelSuffix='${{ steps.label.outputs.value }}' \
+            --output none
+      - name: Recycle stale launcher executions (label-reimage gap)
+        env:
+          OS_PREFIX: lnx
+          RG: ${{ vars.RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          LAUNCHER=$(az containerapp job list -g "$RG" \
+            --query "[?starts_with(name, 'caj-vmss-${OS_PREFIX}-launcher-')].name | [0]" -o tsv)
+          if [[ -z "$LAUNCHER" || "$LAUNCHER" == "null" ]]; then
+            echo "No ${OS_PREFIX} launcher Job found — nothing to recycle"
+            exit 0
+          fi
+          QUERY="[?properties.status=='Running' || properties.status=='Pending' || properties.status=='Processing'].name"
+          EXECS=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+          if [[ -z "$EXECS" ]]; then
+            echo "No active executions to recycle"
+            exit 0
+          fi
+          EXEC_LIST=$(echo "$EXECS" | tr '\n' ',' | sed 's/,$//')
+          echo "Stopping stale executions on $LAUNCHER: $EXEC_LIST"
+          az containerapp job stop -g "$RG" -n "$LAUNCHER" --execution-name-list "$EXEC_LIST" --output none || true
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            LEFT=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+            if [[ -z "$LEFT" ]]; then
+              echo "All stale executions drained"
+              break
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "::warning::Timed out after 5min waiting for executions to drain: $(echo "$LEFT" | tr '\n' ' ')"
+              break
+            fi
+            echo "Still active: $(echo "$LEFT" | tr '\n' ' ') — waiting 10s..."
+            sleep 10
+          done
+
+  vmss-linux-ephemeral-run:
+    name: vmss-linux ephemeral — smoke
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux }}
+    needs: vmss-linux-ephemeral-deploy
+    runs-on: [self-hosted, linux, vmss, "${{ needs.vmss-linux-ephemeral-deploy.outputs.test_label }}"]
+    timeout-minutes: 15
+    outputs:
+      hostname: ${{ steps.ident.outputs.hostname }}
+      ephemeral_flag: ${{ steps.ident.outputs.ephemeral_flag }}
+    steps:
+      - name: Tier capability smoke (docker)
+        run: |
+          set -euo pipefail
+          docker --version
+          docker run --rm hello-world
+      - name: Runner identity + --ephemeral assertion
+        id: ident
+        run: |
+          set -euo pipefail
+          HN=$(hostname)
+          echo "Hostname : $HN"
+          echo "Kernel   : $(uname -sr)"
+          echo "Whoami   : $(id)"
+          EPH="unknown"
+          # The actions/runner records --ephemeral in $RUNNER_ROOT/.runner.
+          # $RUNNER_ROOT is set by the runner for every job step and points
+          # at the actual install directory regardless of service user.
+          CFG=""
+          for candidate in \
+            "${RUNNER_ROOT:-}/.runner" \
+            "/home/ghrunner/actions-runner/.runner" \
+            "/opt/actions-runner/.runner"; do
+            [[ -n "$candidate" && -e "$candidate" ]] && CFG="$candidate" && break
+          done
+          echo "Config   : ${CFG:-<not found>}"
+          if [[ -n "$CFG" ]]; then
+            ls -la "$CFG" || true
+            if [[ -r "$CFG" ]]; then
+              CONTENT=$(cat "$CFG")
+            elif sudo -n cat "$CFG" >/dev/null 2>&1; then
+              CONTENT=$(sudo -n cat "$CFG")
+            else
+              CONTENT=""
+              echo "::warning::config file present but not readable by $(id -un); falling back to label check"
+            fi
+            if [[ -n "$CONTENT" ]]; then
+              if grep -q '"Ephemeral": *true' <<<"$CONTENT"; then EPH=true; else EPH=false; fi
+            fi
+          fi
+          # Fallback: ephemeral runners self-deregister after one job. The
+          # runner that accepted this job exposes its labels via RUNNER_*
+          # env; if that proves insufficient, the teardown-check job below
+          # validates the VM was actually destroyed post-job.
+          if [[ "$EPH" == "unknown" ]]; then
+            echo "::warning::could not read .runner config; deferring proof to teardown-check job"
+            EPH="deferred"
+          fi
+          echo "ephemeral_flag=$EPH" >> "$GITHUB_OUTPUT"
+          echo "hostname=$HN" >> "$GITHUB_OUTPUT"
+          if [[ "$EPH" == "false" ]]; then
+            echo "::error title=Ephemeral flag missing::runner .runner config shows Ephemeral=false"
+            exit 1
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Workspace write
+        run: echo "ephemeral vmss-linux $(date -u +%FT%TZ)" > smoke.txt
+
+  vmss-linux-ephemeral-teardown-check:
+    name: vmss-linux ephemeral — teardown check
+    if: ${{ always() && (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux && needs.vmss-linux-ephemeral-run.result != 'skipped' }}
+    needs: vmss-linux-ephemeral-run
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Wait for ephemeral self-delete
+        run: |
+          echo "Sleeping 180s for ephemeral self-delete to propagate…"
+          sleep 180
+      - name: Assert ephemeral VM is gone
+        env:
+          WITNESS_HOST: ${{ needs.vmss-linux-ephemeral-run.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WITNESS_HOST" ]]; then
+            echo "::warning::No hostname captured (run may have been skipped); nothing to assert"; exit 0
+          fi
+          VMSS=$(az vmss list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'vmss-lnx-')] | [0].name" -o tsv)
+          LEAKED=$(az vmss list-instances \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" \
+            --query "[?osProfile.computerName=='${WITNESS_HOST}'] | length(@)" -o tsv)
+          echo "Instances matching ${WITNESS_HOST}: $LEAKED"
+          if [[ "$LEAKED" != "0" ]]; then
+            echo "::error title=Ephemeral teardown failed::VM ${WITNESS_HOST} still exists after single-job run"
+            exit 1
+          fi
+
+  # Max-lifetime variant (opt-in). Since #100 the watchdog supports a sub-hour
+  # override (MAX_LIFETIME_MINUTES) — this variant uses 3 min by default so the
+  # full recycle check completes in ~8 min of wall clock rather than an hour+.
+  vmss-linux-max-lifetime:
+    name: vmss-linux max-lifetime — recycle check
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-linux') && inputs.enable_vmss_linux && inputs.run_max_lifetime_variant }}
+    needs: vmss-linux-ephemeral-teardown-check
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy infra (retention=warm, maxLifetimeMinutes=max_lifetime_minutes)
+        run: |
+          set -euo pipefail
+          KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+          ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+          SSH_KEY="$(cat "${KEYFILE}.pub")"
+          echo "::add-mask::${SSH_KEY}"
+          rm -f "${KEYFILE}" "${KEYFILE}.pub"
+          az deployment group create \
+            --name "test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             enableVmssLinux=true \
+                             enableVmssWindows=${{ inputs.enable_vmss_windows }} \
+                             enableAibUbuntu=false \
+                             enableAibWindows=false \
+                             vmssLinuxAdminSshPublicKey="$SSH_KEY" \
+                             vmssLinuxIdleRetentionMinutes=${{ inputs.warm_retention_minutes || 3 }} \
+                             vmssLinuxMaxLifetimeHours=${{ inputs.max_lifetime_hours || 1 }} \
+                             vmssLinuxMaxLifetimeMinutes=${{ inputs.max_lifetime_minutes || 3 }} \
+                             vmssRunnerLabelSuffix='${{ env.TEST_LABEL_PREFIX }}-linux-max-lifetime' \
+            --output none
+      - name: Snapshot existing VMSS instance IDs
+        id: snap
+        run: |
+          set -euo pipefail
+          VMSS=$(az vmss list --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'vmss-lnx-')] | [0].name" -o tsv)
+          echo "vmss_name=$VMSS" >> "$GITHUB_OUTPUT"
+          # Force a warm instance to exist
+          az vmss scale --resource-group "${{ vars.RESOURCE_GROUP }}" --name "$VMSS" --new-capacity 1 >/dev/null
+          sleep 30
+          BEFORE=$(az vmss list-instances --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" --query "[].instanceId" -o tsv | sort -u | paste -sd, -)
+          echo "Before: $BEFORE"
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+      - name: Wait max-lifetime window + 5m for watchdog recycle
+        run: |
+          MLM=${{ inputs.max_lifetime_minutes || 3 }}
+          MLH=${{ inputs.max_lifetime_hours || 1 }}
+          if [[ "$MLM" -gt 0 ]]; then
+            SLEEP=$(( MLM * 60 + 300 ))
+            echo "Using max_lifetime_minutes=$MLM; sleeping ${SLEEP}s…"
+          else
+            SLEEP=$(( MLH * 3600 + 300 ))
+            echo "Using max_lifetime_hours=$MLH; sleeping ${SLEEP}s…"
+          fi
+          sleep "$SLEEP"
+      - name: Assert pre-recycle instance IDs are gone
+        run: |
+          set -euo pipefail
+          VMSS='${{ steps.snap.outputs.vmss_name }}'
+          BEFORE='${{ steps.snap.outputs.before }}'
+          AFTER=$(az vmss list-instances --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" --query "[].instanceId" -o tsv | sort -u | paste -sd, -)
+          echo "After:  $AFTER"
+          OVERLAP=0
+          for id in ${BEFORE//,/ }; do
+            if echo ",$AFTER," | grep -q ",${id},"; then
+              echo "::error title=Max-lifetime watchdog failed::instance $id survived the hard cap"
+              OVERLAP=1
+            fi
+          done
+          [[ "$OVERLAP" == "0" ]] || exit 1
+          echo "OK — all pre-window instances recycled"
+
+  # ────────────────────────────────────────────────────────────────────
+  # Tier 4: vmss-windows
+  # ────────────────────────────────────────────────────────────────────
+  vmss-windows-warm-deploy:
+    name: vmss-windows warm — deploy infra
+    # Wait for the full vmss-linux chain (warm → ephemeral → teardown) to finish
+    # before starting the vmss-windows chain. Both chains deploy main.bicep into
+    # the SAME resource group, so their nested module deployments (law-deploy,
+    # identity-deploy, kv-deploy, …) share a global namespace and two parallel
+    # `az deployment group create` invocations race with `DeploymentActive`
+    # errors on whichever nested deployment ARM starts first. The `always()`
+    # keeps vmss-windows running even if the linux chain failed — isolation
+    # between tiers is deliberate so a broken linux tier doesn't mask a working
+    # windows tier.
+    needs: [vmss-linux-warm-deploy, vmss-linux-warm-run-1, vmss-linux-warm-run-2, vmss-linux-warm-teardown-check, vmss-linux-ephemeral-deploy, vmss-linux-ephemeral-run, vmss-linux-ephemeral-teardown-check]
+    if: ${{ always() && (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    outputs:
+      test_label: ${{ steps.label.outputs.value }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Compute TEST_LABEL
+        id: label
+        run: echo "value=${TEST_LABEL_PREFIX}-windows-warm" >> "$GITHUB_OUTPUT"
+      - name: Deploy infra (retention=warm_retention_minutes)
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${{ inputs.enable_vmss_linux }}" == "true" ]]; then
+            KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+            ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+            SSH_KEY="$(cat "${KEYFILE}.pub")"
+            echo "::add-mask::${SSH_KEY}"
+            rm -f "${KEYFILE}" "${KEYFILE}.pub"
+            # Use bash array so the SSH key (which contains spaces: "ssh-rsa <b64> <comment>")
+            # is passed as a single az CLI arg. Previously unquoted $EXTRA word-split the
+            # key into multiple tokens and az treated "AAAAB3..." as a new param name.
+            EXTRA_ARGS=("enableVmssLinux=true" "vmssLinuxAdminSshPublicKey=$SSH_KEY")
+          fi
+          az deployment group create \
+            --name "test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             enableVmssWindows=true \
+                             enableAibUbuntu=false \
+                             enableAibWindows=false \
+                             vmssWindowsIdleRetentionMinutes=${{ inputs.warm_retention_minutes || 3 }} \
+                             vmssWindowsMaxLifetimeHours=12 \
+                             vmssRunnerLabelSuffix='${{ steps.label.outputs.value }}' \
+                             "${EXTRA_ARGS[@]}" \
+            --output none
+      - name: Recycle stale launcher executions (label-reimage gap)
+        # See vmss-linux-warm-deploy for the full rationale. Windows is the
+        # tier where this gap is most damaging because cold-boot is ~10–15min
+        # and warm-run-1 timeout is 20min, so any delay caused by stale execs
+        # holding KEDA's parallelism count wedges the next test run.
+        env:
+          OS_PREFIX: win
+          RG: ${{ vars.RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          LAUNCHER=$(az containerapp job list -g "$RG" \
+            --query "[?starts_with(name, 'caj-vmss-${OS_PREFIX}-launcher-')].name | [0]" -o tsv)
+          if [[ -z "$LAUNCHER" || "$LAUNCHER" == "null" ]]; then
+            echo "No ${OS_PREFIX} launcher Job found — nothing to recycle"
+            exit 0
+          fi
+          echo "Launcher: $LAUNCHER"
+          QUERY="[?properties.status=='Running' || properties.status=='Pending' || properties.status=='Processing'].name"
+          EXECS=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+          if [[ -z "$EXECS" ]]; then
+            echo "No active executions to recycle"
+            exit 0
+          fi
+          EXEC_LIST=$(echo "$EXECS" | tr '\n' ',' | sed 's/,$//')
+          echo "Stopping stale executions: $EXEC_LIST"
+          az containerapp job stop -g "$RG" -n "$LAUNCHER" --execution-name-list "$EXEC_LIST" --output none || true
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            LEFT=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+            if [[ -z "$LEFT" ]]; then
+              echo "All stale executions drained"
+              break
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "::warning::Timed out after 5min waiting for executions to drain: $(echo "$LEFT" | tr '\n' ' ')"
+              break
+            fi
+            echo "Still active: $(echo "$LEFT" | tr '\n' ' ') — waiting 10s..."
+            sleep 10
+          done
+
+  vmss-windows-warm-run-1:
+    name: vmss-windows warm — run 1 (write witness)
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows }}
+    needs: vmss-windows-warm-deploy
+    runs-on: [self-hosted, windows, vmss, "${{ needs.vmss-windows-warm-deploy.outputs.test_label }}"]
+    timeout-minutes: 20
+    outputs:
+      uuid: ${{ steps.witness.outputs.uuid }}
+      hostname: ${{ steps.witness.outputs.hostname }}
+    steps:
+      - name: Tier capability smoke (WSL / Hyper-V)
+        shell: pwsh
+        run: |
+          Write-Host '--- WSL status ---'
+          try { wsl --status } catch { Write-Host "wsl not available: $_" }
+          Write-Host '--- Hyper-V feature ---'
+          try {
+            $hv = Get-WindowsFeature -Name Hyper-V -ErrorAction Stop
+            Write-Host "Hyper-V InstallState: $($hv.InstallState)"
+          } catch {
+            Write-Host "Get-WindowsFeature unavailable (likely client SKU): $_"
+          }
+      - name: Write witness
+        id: witness
+        shell: pwsh
+        env:
+          TEST_LABEL: ${{ needs.vmss-windows-warm-deploy.outputs.test_label }}
+        run: |
+          $uuid    = [guid]::NewGuid().ToString()
+          $hn      = $env:COMPUTERNAME
+          # Use $HOME (not C:\Windows\Temp) — the job-completed cleanup hook
+          # wipes $env:TEMP between jobs for security (issue #90), which
+          # under some runner service contexts resolves to C:\Windows\Temp.
+          # $HOME persists across warm-reuse jobs.
+          $witness = Join-Path $HOME "warm-witness-$($env:TEST_LABEL).txt"
+          "$uuid $hn" | Out-File -FilePath $witness -Encoding ascii
+          Write-Host "Witness: $witness"
+          Get-Content $witness
+          "uuid=$uuid"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "hostname=$hn"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  vmss-windows-warm-run-2:
+    name: vmss-windows warm — run 2 (assert same VM)
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows }}
+    needs: [vmss-windows-warm-deploy, vmss-windows-warm-run-1]
+    runs-on: [self-hosted, windows, vmss, "${{ needs.vmss-windows-warm-deploy.outputs.test_label }}"]
+    timeout-minutes: 20
+    steps:
+      - name: Verify witness
+        shell: pwsh
+        env:
+          TEST_LABEL: ${{ needs.vmss-windows-warm-deploy.outputs.test_label }}
+          EXPECTED_UUID: ${{ needs.vmss-windows-warm-run-1.outputs.uuid }}
+          EXPECTED_HOST: ${{ needs.vmss-windows-warm-run-1.outputs.hostname }}
+        run: |
+          $witness      = Join-Path $HOME "warm-witness-$($env:TEST_LABEL).txt"
+          $expectedUuid = $env:EXPECTED_UUID
+          $expectedHost = $env:EXPECTED_HOST
+          $actualHost   = $env:COMPUTERNAME
+          if (-not (Test-Path $witness)) {
+            Write-Host "::error title=Warm retention broken::Witness $witness not found on $actualHost (cold VM — run-1 ran on $expectedHost)"
+            exit 1
+          }
+          $line = (Get-Content $witness -Raw).Trim()
+          $gotUuid, $gotHost = $line -split '\s+', 2
+          if ($gotUuid -ne $expectedUuid -or $gotHost -ne $expectedHost -or $actualHost -ne $expectedHost) {
+            Write-Host "::error title=Warm retention broken::Witness mismatch. expected=$expectedUuid/$expectedHost got=$gotUuid/$gotHost actual=$actualHost"
+            exit 1
+          }
+          Write-Host "OK — warm VM reused: $actualHost"
+
+  vmss-windows-warm-teardown-check:
+    name: vmss-windows warm — teardown check
+    if: ${{ always() && (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows && needs.vmss-windows-warm-run-1.result != 'skipped' }}
+    needs: [vmss-windows-warm-deploy, vmss-windows-warm-run-1, vmss-windows-warm-run-2]
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Wait for retention + watchdog + grace
+        run: |
+          RET=${{ inputs.warm_retention_minutes || 3 }}
+          SLEEP=$(( RET * 60 + 120 ))
+          echo "Sleeping ${SLEEP}s (retention ${RET}m + 2m grace)…"
+          sleep "$SLEEP"
+      - name: Assert test-run VM no longer exists
+        env:
+          WITNESS_HOST: ${{ needs.vmss-windows-warm-run-1.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WITNESS_HOST" ]]; then
+            echo "::error::No witness hostname from run-1"; exit 1
+          fi
+          VMSS=$(az vmss list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'vmss-win-')] | [0].name" \
+            -o tsv)
+          if [[ -z "$VMSS" || "$VMSS" == "None" ]]; then
+            echo "::error::No vmss-win-* scale set found"
+            exit 1
+          fi
+          LEAKED=$(az vmss list-instances \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" \
+            --query "[?osProfile.computerName=='${WITNESS_HOST}'] | length(@)" -o tsv)
+          echo "Instances matching witness host ${WITNESS_HOST}: $LEAKED"
+          if [[ "$LEAKED" != "0" ]]; then
+            echo "::error title=Watchdog failed::Test-run VM '${WITNESS_HOST}' still present after retention expiry"
+            exit 1
+          fi
+      # (See vmss-linux-warm-teardown-check — runner-leak check elided
+      # because `administration: read` is not a valid GITHUB_TOKEN
+      # permission; VM-leak check above is sufficient.)
+
+  vmss-windows-ephemeral-deploy:
+    name: vmss-windows ephemeral — deploy infra
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows }}
+    needs: vmss-windows-warm-teardown-check
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    outputs:
+      test_label: ${{ steps.label.outputs.value }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Compute TEST_LABEL
+        id: label
+        run: echo "value=${TEST_LABEL_PREFIX}-windows-ephemeral" >> "$GITHUB_OUTPUT"
+      - name: Deploy infra (retention=0)
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${{ inputs.enable_vmss_linux }}" == "true" ]]; then
+            KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+            ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+            SSH_KEY="$(cat "${KEYFILE}.pub")"
+            echo "::add-mask::${SSH_KEY}"
+            rm -f "${KEYFILE}" "${KEYFILE}.pub"
+            EXTRA_ARGS=("enableVmssLinux=true" "vmssLinuxAdminSshPublicKey=$SSH_KEY")
+          fi
+          az deployment group create \
+            --name "test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             enableVmssWindows=true \
+                             enableAibUbuntu=false \
+                             enableAibWindows=false \
+                             vmssWindowsIdleRetentionMinutes=0 \
+                             vmssWindowsMaxLifetimeHours=12 \
+                             vmssRunnerLabelSuffix='${{ steps.label.outputs.value }}' \
+                             "${EXTRA_ARGS[@]}" \
+            --output none
+      - name: Recycle stale launcher executions (label-reimage gap)
+        env:
+          OS_PREFIX: win
+          RG: ${{ vars.RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          LAUNCHER=$(az containerapp job list -g "$RG" \
+            --query "[?starts_with(name, 'caj-vmss-${OS_PREFIX}-launcher-')].name | [0]" -o tsv)
+          if [[ -z "$LAUNCHER" || "$LAUNCHER" == "null" ]]; then
+            echo "No ${OS_PREFIX} launcher Job found — nothing to recycle"
+            exit 0
+          fi
+          QUERY="[?properties.status=='Running' || properties.status=='Pending' || properties.status=='Processing'].name"
+          EXECS=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+          if [[ -z "$EXECS" ]]; then
+            echo "No active executions to recycle"
+            exit 0
+          fi
+          EXEC_LIST=$(echo "$EXECS" | tr '\n' ',' | sed 's/,$//')
+          echo "Stopping stale executions on $LAUNCHER: $EXEC_LIST"
+          az containerapp job stop -g "$RG" -n "$LAUNCHER" --execution-name-list "$EXEC_LIST" --output none || true
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            LEFT=$(az containerapp job execution list -g "$RG" -n "$LAUNCHER" --query "$QUERY" -o tsv || true)
+            if [[ -z "$LEFT" ]]; then
+              echo "All stale executions drained"
+              break
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "::warning::Timed out after 5min waiting for executions to drain: $(echo "$LEFT" | tr '\n' ' ')"
+              break
+            fi
+            echo "Still active: $(echo "$LEFT" | tr '\n' ' ') — waiting 10s..."
+            sleep 10
+          done
+
+  vmss-windows-ephemeral-run:
+    name: vmss-windows ephemeral — smoke
+    if: ${{ (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows }}
+    needs: vmss-windows-ephemeral-deploy
+    runs-on: [self-hosted, windows, vmss, "${{ needs.vmss-windows-ephemeral-deploy.outputs.test_label }}"]
+    timeout-minutes: 20
+    outputs:
+      hostname: ${{ steps.ident.outputs.hostname }}
+    steps:
+      - name: Runner identity + --ephemeral assertion
+        id: ident
+        shell: pwsh
+        run: |
+          $hn = $env:COMPUTERNAME
+          Write-Host "Hostname : $hn"
+          $cfg = 'C:\actions-runner\.runner'
+          if (-not (Test-Path $cfg)) { $cfg = 'C:\a\.runner' }
+          $eph = $false
+          if (Test-Path $cfg) {
+            $content = Get-Content $cfg -Raw
+            if ($content -match '"Ephemeral"\s*:\s*true') { $eph = $true }
+          }
+          "hostname=$hn" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $eph) {
+            Write-Host "::error title=Ephemeral flag missing::runner .runner config does not show Ephemeral=true"
+            exit 1
+          }
+          Write-Host 'OK — --ephemeral confirmed'
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Workspace write
+        shell: pwsh
+        run: |
+          "ephemeral vmss-windows $(Get-Date -Format o)" | Out-File smoke.txt
+
+  vmss-windows-ephemeral-teardown-check:
+    name: vmss-windows ephemeral — teardown check
+    if: ${{ always() && (inputs.tier == 'all' || inputs.tier == 'vmss-windows') && inputs.enable_vmss_windows && needs.vmss-windows-ephemeral-run.result != 'skipped' }}
+    needs: vmss-windows-ephemeral-run
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Wait for ephemeral self-delete
+        run: |
+          echo "Sleeping 240s for Windows ephemeral self-delete to propagate…"
+          sleep 240
+      - name: Assert ephemeral VM is gone
+        env:
+          WITNESS_HOST: ${{ needs.vmss-windows-ephemeral-run.outputs.hostname }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WITNESS_HOST" ]]; then
+            echo "::warning::No hostname captured"; exit 0
+          fi
+          VMSS=$(az vmss list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "[?starts_with(name, 'vmss-win-')] | [0].name" -o tsv)
+          LEAKED=$(az vmss list-instances \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VMSS" \
+            --query "[?osProfile.computerName=='${WITNESS_HOST}'] | length(@)" -o tsv)
+          echo "Instances matching ${WITNESS_HOST}: $LEAKED"
+          if [[ "$LEAKED" != "0" ]]; then
+            echo "::error title=Ephemeral teardown failed::VM ${WITNESS_HOST} still exists after single-job run"
+            exit 1
+          fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # Summary
+  # ────────────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    if: always()
+    needs:
+      - test-aca-linux
+      - test-aci-windows
+      - vmss-linux-warm-deploy
+      - vmss-linux-warm-run-1
+      - vmss-linux-warm-run-2
+      - vmss-linux-warm-teardown-check
+      - vmss-linux-ephemeral-deploy
+      - vmss-linux-ephemeral-run
+      - vmss-linux-ephemeral-teardown-check
+      - vmss-linux-max-lifetime
+      - vmss-windows-warm-deploy
+      - vmss-windows-warm-run-1
+      - vmss-windows-warm-run-2
+      - vmss-windows-warm-teardown-check
+      - vmss-windows-ephemeral-deploy
+      - vmss-windows-ephemeral-run
+      - vmss-windows-ephemeral-teardown-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Test runners — summary"
+            echo ""
+            echo "| Tier | Job | Result |"
+            echo "|------|-----|--------|"
+            echo "| aca-linux     | smoke                        | ${{ needs.test-aca-linux.result }} |"
+            echo "| aci-windows   | smoke                        | ${{ needs.test-aci-windows.result }} |"
+            echo "| vmss-linux    | warm-deploy                  | ${{ needs.vmss-linux-warm-deploy.result }} |"
+            echo "| vmss-linux    | warm-run-1                   | ${{ needs.vmss-linux-warm-run-1.result }} |"
+            echo "| vmss-linux    | warm-run-2                   | ${{ needs.vmss-linux-warm-run-2.result }} |"
+            echo "| vmss-linux    | warm-teardown-check          | ${{ needs.vmss-linux-warm-teardown-check.result }} |"
+            echo "| vmss-linux    | ephemeral-deploy             | ${{ needs.vmss-linux-ephemeral-deploy.result }} |"
+            echo "| vmss-linux    | ephemeral-run                | ${{ needs.vmss-linux-ephemeral-run.result }} |"
+            echo "| vmss-linux    | ephemeral-teardown-check     | ${{ needs.vmss-linux-ephemeral-teardown-check.result }} |"
+            echo "| vmss-linux    | max-lifetime                 | ${{ needs.vmss-linux-max-lifetime.result }} |"
+            echo "| vmss-windows  | warm-deploy                  | ${{ needs.vmss-windows-warm-deploy.result }} |"
+            echo "| vmss-windows  | warm-run-1                   | ${{ needs.vmss-windows-warm-run-1.result }} |"
+            echo "| vmss-windows  | warm-run-2                   | ${{ needs.vmss-windows-warm-run-2.result }} |"
+            echo "| vmss-windows  | warm-teardown-check          | ${{ needs.vmss-windows-warm-teardown-check.result }} |"
+            echo "| vmss-windows  | ephemeral-deploy             | ${{ needs.vmss-windows-ephemeral-deploy.result }} |"
+            echo "| vmss-windows  | ephemeral-run                | ${{ needs.vmss-windows-ephemeral-run.result }} |"
+            echo "| vmss-windows  | ephemeral-teardown-check     | ${{ needs.vmss-windows-ephemeral-teardown-check.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

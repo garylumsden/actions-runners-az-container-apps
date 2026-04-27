@@ -1,0 +1,742 @@
+name: Build & Publish Runner VHDs
+
+# Bakes Azure Image Builder (AIB) templates for the optional VMSS runner
+# tiers. Each tier has its own imageTemplate resource deployed by
+# `deploy.yml`; this workflow simply triggers a run on those existing
+# templates, which publish a new version into the shared image gallery.
+#
+# After each bake succeeds the workflow runs a canary job that:
+#   1. Locates the just-published gallery image version.
+#   2. Immediately marks it `excludeFromLatest=true` so VMSS tiers keep
+#      picking the previous known-good version until the canary passes.
+#   3. Creates a throwaway VM from that specific version and waits for
+#      it to register with GitHub (proving bootstrap actually succeeds
+#      on real infra, not just that AIB's internal provisioner ran).
+#   4. On success: flips `excludeFromLatest=false` so VMSS can roll
+#      forward. On failure: leaves it excluded and fails the workflow.
+#
+# When the VMSS tiers are disabled (enableVmssLinux / enableVmssWindows
+# both false), the imageTemplate resources do not exist and this workflow
+# will fail its discovery step — which is the desired behaviour.
+
+on:
+  # Scheduled run disabled — manual dispatch only.
+  # Weekly base-image refresh — Sunday 22:00 UTC (10 pm GMT / 11 pm BST),
+  # aligned with build-images.yml so VHDs and container images refresh
+  # together.
+  # schedule:
+  #   - cron: '0 22 * * 0'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Which tier(s) to bake'
+        type: choice
+        options:
+          - both
+          - linux
+          - windows
+        default: both
+      runnerImagesCommit:
+        description: 'actions/runner-images commit SHA to pin tool scripts to (empty = use pinned default from bicepparam)'
+        type: string
+        default: ''
+      skip_canary:
+        description: 'Skip post-bake canary (NOT recommended — image is promoted untested).'
+        type: boolean
+        default: false
+      canary_subnet_id:
+        description: 'Subnet resource ID for the canary VM NIC. If empty, auto-discovers from the most recent deployment of main.bicep that enabled VMSS (output vmssSubnetId).'
+        type: string
+        default: ''
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+# One bake per tier at a time; queue follow-ups rather than cancel mid-bake
+# (an AIB run takes 40-90 minutes and cancelling part way through leaves
+# the template in a broken state).
+concurrency:
+  group: build-vhds-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bake-linux:
+    name: Bake Linux VHD
+    if: ${{ github.event_name == 'schedule' || inputs.tier == 'linux' || inputs.tier == 'both' }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Discover AIB Linux template
+        id: tpl
+        run: |
+          set -euo pipefail
+          echo "::group::Locate aib-ubuntu imageTemplate"
+          NAME=$(az resource list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+            --query "[?starts_with(name, 'aib-ubuntu')] | [0].name" \
+            -o tsv)
+          if [[ -z "$NAME" || "$NAME" == "None" ]]; then
+            echo "::error::No imageTemplate matching 'aib-ubuntu*' found in ${{ vars.RESOURCE_GROUP }}. Deploy with enableVmssLinux=true first."
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Found: $NAME"
+          echo "::endgroup::"
+
+      # Tenant Azure Policy denies `allowSharedKeyAccess: true` on all storage
+      # accounts, which blocks AIB's staging SA (AIB requires key-based access to
+      # its own staging blob container during bake). We tag the staging SA with
+      # `SecurityControl: Ignore` — the tenant-policy exemption marker — and
+      # re-enable shared-key auth on it. Staging RG/SA are created when the
+      # imageTemplate resource is first provisioned, so they exist by the time
+      # this step runs. This workaround is documented in-repo only and is
+      # confined to this workflow (workflows are disabled on the mirror).
+      - name: Tag AIB staging SA for policy exemption (Linux)
+        run: |
+          set -euo pipefail
+          echo "::group::Tag staging SA (Linux) for policy exemption"
+          TPL_ID=$(az resource show \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --query id -o tsv)
+          SUB=$(echo "$TPL_ID" | awk -F/ '{print $3}')
+          STAGING_RG=$(az resource list \
+            --query "[?type=='Microsoft.Resources/resourceGroups' && starts_with(name, 'IT_${{ vars.RESOURCE_GROUP }}_${{ steps.tpl.outputs.name }}_')].name | [0]" \
+            -o tsv 2>/dev/null || true)
+          if [[ -z "$STAGING_RG" || "$STAGING_RG" == "None" ]]; then
+            STAGING_RG=$(az group list \
+              --query "[?starts_with(name, 'IT_${{ vars.RESOURCE_GROUP }}_${{ steps.tpl.outputs.name }}_')].name | [0]" \
+              -o tsv)
+          fi
+          if [[ -z "$STAGING_RG" || "$STAGING_RG" == "None" ]]; then
+            echo "::warning::No staging RG found yet for ${{ steps.tpl.outputs.name }} — AIB will create one at bake start and the bake will likely fail the first time. Re-run this workflow to retry."
+          else
+            echo "Staging RG: $STAGING_RG"
+            SA=$(az storage account list --resource-group "$STAGING_RG" --query "[0].name" -o tsv)
+            if [[ -n "$SA" && "$SA" != "None" ]]; then
+              echo "Staging SA: $SA"
+              az tag update --resource-id "/subscriptions/$SUB/resourceGroups/$STAGING_RG/providers/Microsoft.Storage/storageAccounts/$SA" --operation merge --tags SecurityControl=Ignore 1>/dev/null
+              az storage account update --name "$SA" --resource-group "$STAGING_RG" --allow-shared-key-access true 1>/dev/null
+              echo "Tagged + enabled shared-key on $SA"
+            else
+              echo "::warning::Staging RG $STAGING_RG exists but no SA inside yet."
+            fi
+          fi
+          echo "::endgroup::"
+
+      - name: Run AIB bake (Linux)
+        run: |
+          set -euo pipefail
+          echo "::group::az image builder run (Linux) — ~40 min"
+          az image builder run \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}"
+          echo "::endgroup::"
+
+      - name: Show last run outcome
+        id: bake
+        run: |
+          set -euo pipefail
+          echo "::group::az image builder show-runs"
+          az image builder show-runs \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --output table
+          echo "::endgroup::"
+          STATE=$(az image builder show \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "lastRunStatus.runState" -o tsv)
+          echo "Last run state: $STATE"
+          if [[ "$STATE" != "Succeeded" ]]; then
+            echo "::error::AIB Linux bake ended in state '$STATE' (expected 'Succeeded')"
+            exit 1
+          fi
+          # Resolve the gallery image this template distributes into, so the
+          # canary job can pin to the specific version just published.
+          # NOTE: We intentionally emit only the gallery + image short names
+          # (never the full resource ID) because Actions strips any step/job
+          # output containing masked values (AZURE_SUBSCRIPTION_ID is masked).
+          GID=$(az image builder show \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "distribute[0].galleryImageId" -o tsv)
+          echo "Gallery image id: $GID"
+          IMAGE_NAME="${GID##*/}"
+          GALLERY_NAME="${GID%/images/*}"
+          GALLERY_NAME="${GALLERY_NAME##*/}"
+          echo "gallery_name=$GALLERY_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE_NAME"     >> "$GITHUB_OUTPUT"
+    outputs:
+      template_name: ${{ steps.tpl.outputs.name }}
+      gallery_name:  ${{ steps.bake.outputs.gallery_name }}
+      image_name:    ${{ steps.bake.outputs.image_name }}
+
+  canary-linux:
+    name: Canary — Linux
+    needs: bake-linux
+    if: ${{ needs.bake-linux.result == 'success' && !inputs.skip_canary }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Resolve newest gallery image version
+        id: ver
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-linux.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-linux.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GALLERY_NAME" || -z "$IMAGE_NAME" ]]; then
+            echo "::error::bake-linux did not emit gallery_name/image_name"; exit 1
+          fi
+          # Use explicit -g/-r/-i flags. `az sig image-version list --ids` only
+          # accepts a *version*-level ID, not the parent image-definition ID,
+          # so it falls through to demanding the explicit args anyway. Use the
+          # active subscription set by azure/login — no need to construct an ID.
+          VERSION=$(az sig image-version list \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" \
+            --query "sort_by([], &publishingProfile.publishedDate)[-1].name" -o tsv)
+          if [[ -z "$VERSION" || "$VERSION" == "None" ]]; then
+            echo "::error::No published versions under ${GALLERY_NAME}/${IMAGE_NAME}"; exit 1
+          fi
+          echo "Version: $VERSION"
+          # Only emit the short version number as a step output — the full
+          # resource ID contains the masked subscription ID and would be
+          # stripped from step outputs. Downstream steps reconstruct it.
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Exclude new version from 'latest' until canary passes
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-linux.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-linux.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `az sig image-version update` requires explicit -g/-r/-i/-e — the
+          # `--ids` form was rejected by the CLI in CI (Azure CLI 2.x) even
+          # with a version-level resource ID. See canary-linux for context.
+          az sig image-version update \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" -e "$VERSION" \
+            --set publishingProfile.excludeFromLatest=true \
+            --output none
+          echo "Excluded ${VERSION} from latest"
+      - name: Create throwaway canary VM
+        id: vm
+        env:
+          CANARY_SUBNET_INPUT: ${{ inputs.canary_subnet_id }}
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-linux.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-linux.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          VER_ID="/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/galleries/${GALLERY_NAME}/images/${IMAGE_NAME}/versions/${VERSION}"
+          # Resolve subnet: prefer explicit input, else discover from the
+          # self-contained VMSS VNet provisioned by main.bicep.
+          SUBNET="$CANARY_SUBNET_INPUT"
+          if [[ -z "$SUBNET" ]]; then
+            # Discover the VMSS VNet/subnet in this RG (there is only ever one
+            # VNet named vnet-* with a snet-vmss subnet — created by vmss-network.bicep).
+            SUBNET=$(az network vnet list \
+              --resource-group "${{ vars.RESOURCE_GROUP }}" \
+              --query "[?subnets[?name=='snet-vmss']] | [0].subnets[?name=='snet-vmss'] | [0].id" \
+              -o tsv 2>/dev/null || true)
+          fi
+          if [[ -z "$SUBNET" ]]; then
+            echo "::error::Could not resolve canary subnet. Pass canary_subnet_id, or deploy VMSS stack first."
+            exit 1
+          fi
+          # Generate a throwaway SSH keypair — private key discarded on step exit.
+          KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" canary_key.XXXXXX)"
+          ssh-keygen -t rsa -b 4096 -N '' -C 'canary-throwaway' -f "${KEYFILE}" -q
+          SSH_KEY="$(cat "${KEYFILE}.pub")"
+          echo "::add-mask::${SSH_KEY}"
+          VM_NAME="canary-lnx-${GITHUB_RUN_ID}"
+          echo "vm_name=$VM_NAME" >> "$GITHUB_OUTPUT"
+          # AIB bakes images with TrustedLaunch security type, so the canary
+          # VM must be created with the same security type or VM creation
+          # fails with: "The provided gallery image only supports creation
+          # of VMs and VM Scale Sets with 'TrustedLaunch' security type."
+          az vm create \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VM_NAME" \
+            --image "$VER_ID" \
+            --size Standard_D2s_v5 \
+            --security-type TrustedLaunch \
+            --enable-secure-boot true \
+            --enable-vtpm true \
+            --admin-username ghrunner \
+            --ssh-key-values "$SSH_KEY" \
+            --subnet "$SUBNET" \
+            --public-ip-address "" \
+            --nsg "" \
+            --tags ghRunnerIdleRetentionMinutes=0 ghRunnerMaxLifetimeHours=1 canary=true runId=${GITHUB_RUN_ID} \
+            --output none
+          echo "Canary VM created: $VM_NAME"
+      - name: Mint GitHub App installation token
+        # github.token cannot read self-hosted runners (403), so the polling
+        # loop never sees the canary register. Mint a short-lived installation
+        # access token from the GitHub App PEM (same App used by the runner
+        # entrypoint) and use it for the poll + cleanup steps below.
+        id: app_token
+        env:
+          APP_ID: ${{ vars.GH_APP_ID }}
+          INSTALLATION_ID: ${{ vars.GH_INSTALLATION_ID }}
+          APP_PEM_B64: ${{ secrets.GH_APP_PEM_B64 }}
+        run: |
+          set -euo pipefail
+          PEM_FILE="$(mktemp -p "${RUNNER_TEMP:-/tmp}" gh_app.XXXXXX.pem)"
+          trap 'rm -f "$PEM_FILE"' EXIT
+          ( umask 077; printf '%s' "$APP_PEM_B64" | base64 -d > "$PEM_FILE" )
+          now=$(date +%s); iat=$((now - 60)); exp=$((now + 540))
+          b64() { openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
+          header=$(printf '%s' '{"typ":"JWT","alg":"RS256"}' | b64)
+          payload=$(printf '%s' "{\"iat\":${iat},\"exp\":${exp},\"iss\":${APP_ID}}" | b64)
+          signature=$(printf '%s' "${header}.${payload}" | openssl dgst -sha256 -sign "$PEM_FILE" | b64)
+          JWT="${header}.${payload}.${signature}"
+          TOKEN=$(curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${JWT}" \
+            "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
+            | jq -r '.token')
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::Failed to mint GitHub App installation token"
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+      - name: Wait for canary runner to register
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          set -euo pipefail
+          # Poll up to 10 minutes for the runner to appear. Bootstrap runs
+          # via cloud-init/systemd inside the baked image — so its presence
+          # in the registry proves the full image + bootstrap chain works.
+          DEADLINE=$((SECONDS + 600))
+          while (( SECONDS < DEADLINE )); do
+            FOUND=$(gh api "/repos/${{ github.repository }}/actions/runners" --paginate \
+              --jq "[.runners[] | select(.name | ascii_downcase | startswith(\"$(echo -n "$VM_NAME" | tr 'A-Z' 'a-z')\"))] | length")
+            echo "Registered runners matching ${VM_NAME}*: $FOUND"
+            if [[ "$FOUND" -ge 1 ]]; then
+              echo "Canary runner registered — image is good"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error title=Canary failed::Linux image version ${{ steps.ver.outputs.version }} did not produce a registered runner within 10m"
+          exit 1
+      - name: Promote canary version (clear excludeFromLatest)
+        if: success()
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-linux.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-linux.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          az sig image-version update \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" -e "$VERSION" \
+            --set publishingProfile.excludeFromLatest=false \
+            --output none
+          echo "Promoted ${VERSION} to latest"
+      - name: Delete canary VM (always)
+        if: always() && steps.vm.outputs.vm_name != ''
+        env:
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          set -euo pipefail
+          echo "Deleting canary VM ${VM_NAME}…"
+          az vm delete --resource-group "${{ vars.RESOURCE_GROUP }}" --name "$VM_NAME" --yes --output none || true
+          # Best-effort: the implicit NIC/disks share the VM name prefix.
+          for r in $(az resource list -g "${{ vars.RESOURCE_GROUP }}" --query "[?starts_with(name, '${VM_NAME}')].id" -o tsv); do
+            echo "Deleting residual resource: $r"
+            az resource delete --ids "$r" --output none || true
+          done
+      - name: Deregister canary runner (always)
+        if: always()
+        env:
+          # Use the GitHub App installation token (github.token gets 403 on
+          # /actions/runners). Token may be empty if the mint step failed or
+          # was skipped on early failure — the `|| true` keeps cleanup best-effort.
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          set -euo pipefail
+          [[ -z "$VM_NAME" ]] && exit 0
+          [[ -z "${GH_TOKEN:-}" ]] && { echo "App token unavailable; skipping runner deregistration"; exit 0; }
+          IDS=$(gh api "/repos/${{ github.repository }}/actions/runners" --paginate \
+            --jq ".runners[] | select(.name | ascii_downcase | startswith(\"$(echo -n "$VM_NAME" | tr 'A-Z' 'a-z')\")) | .id" 2>/dev/null || true)
+          for id in $IDS; do
+            echo "Deleting leftover runner id=$id"
+            gh api -X DELETE "/repos/${{ github.repository }}/actions/runners/${id}" || true
+          done
+
+  bake-windows:
+    name: Bake Windows VHD
+    if: ${{ github.event_name == 'schedule' || inputs.tier == 'windows' || inputs.tier == 'both' }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Discover AIB Windows template
+        id: tpl
+        run: |
+          set -euo pipefail
+          echo "::group::Locate aib-windows imageTemplate"
+          NAME=$(az resource list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+            --query "[?starts_with(name, 'aib-windows')] | [0].name" \
+            -o tsv)
+          if [[ -z "$NAME" || "$NAME" == "None" ]]; then
+            echo "::error::No imageTemplate matching 'aib-windows*' found in ${{ vars.RESOURCE_GROUP }}. Deploy with enableVmssWindows=true first."
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Found: $NAME"
+          echo "::endgroup::"
+
+      # See "Tag AIB staging SA for policy exemption (Linux)" above for the full
+      # rationale. Same treatment is required for the Windows bake's staging SA.
+      - name: Tag AIB staging SA for policy exemption (Windows)
+        run: |
+          set -euo pipefail
+          echo "::group::Tag staging SA (Windows) for policy exemption"
+          TPL_ID=$(az resource show \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --query id -o tsv)
+          SUB=$(echo "$TPL_ID" | awk -F/ '{print $3}')
+          STAGING_RG=$(az group list \
+            --query "[?starts_with(name, 'IT_${{ vars.RESOURCE_GROUP }}_${{ steps.tpl.outputs.name }}_')].name | [0]" \
+            -o tsv)
+          if [[ -z "$STAGING_RG" || "$STAGING_RG" == "None" ]]; then
+            echo "::warning::No staging RG found yet for ${{ steps.tpl.outputs.name }} — AIB will create one at bake start and the bake will likely fail the first time. Re-run this workflow to retry."
+          else
+            echo "Staging RG: $STAGING_RG"
+            SA=$(az storage account list --resource-group "$STAGING_RG" --query "[0].name" -o tsv)
+            if [[ -n "$SA" && "$SA" != "None" ]]; then
+              echo "Staging SA: $SA"
+              az tag update --resource-id "/subscriptions/$SUB/resourceGroups/$STAGING_RG/providers/Microsoft.Storage/storageAccounts/$SA" --operation merge --tags SecurityControl=Ignore 1>/dev/null
+              az storage account update --name "$SA" --resource-group "$STAGING_RG" --allow-shared-key-access true 1>/dev/null
+              echo "Tagged + enabled shared-key on $SA"
+            else
+              echo "::warning::Staging RG $STAGING_RG exists but no SA inside yet."
+            fi
+          fi
+          echo "::endgroup::"
+
+      - name: Run AIB bake (Windows)
+        run: |
+          set -euo pipefail
+          echo "::group::az image builder run (Windows) — ~90 min"
+          az image builder run \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}"
+          echo "::endgroup::"
+
+      - name: Show last run outcome
+        id: bake
+        run: |
+          set -euo pipefail
+          echo "::group::az image builder show-runs"
+          az image builder show-runs \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --output table
+          echo "::endgroup::"
+          STATE=$(az image builder show \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "lastRunStatus.runState" -o tsv)
+          echo "Last run state: $STATE"
+          if [[ "$STATE" != "Succeeded" ]]; then
+            echo "::error::AIB Windows bake ended in state '$STATE' (expected 'Succeeded')"
+            exit 1
+          fi
+          # Emit short names only — see bake-linux for rationale.
+          GID=$(az image builder show \
+            --name "${{ steps.tpl.outputs.name }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "distribute[0].galleryImageId" -o tsv)
+          echo "Gallery image id: $GID"
+          IMAGE_NAME="${GID##*/}"
+          GALLERY_NAME="${GID%/images/*}"
+          GALLERY_NAME="${GALLERY_NAME##*/}"
+          echo "gallery_name=$GALLERY_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE_NAME"     >> "$GITHUB_OUTPUT"
+    outputs:
+      template_name: ${{ steps.tpl.outputs.name }}
+      gallery_name:  ${{ steps.bake.outputs.gallery_name }}
+      image_name:    ${{ steps.bake.outputs.image_name }}
+
+  canary-windows:
+    name: Canary — Windows
+    needs: bake-windows
+    if: ${{ needs.bake-windows.result == 'success' && !inputs.skip_canary }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Resolve newest gallery image version
+        id: ver
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-windows.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-windows.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GALLERY_NAME" || -z "$IMAGE_NAME" ]]; then
+            echo "::error::bake-windows did not emit gallery_name/image_name"; exit 1
+          fi
+          # See canary-linux for rationale: --ids requires a version-level ID
+          # for `image-version list`, so use explicit -g/-r/-i flags.
+          VERSION=$(az sig image-version list \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" \
+            --query "sort_by([], &publishingProfile.publishedDate)[-1].name" -o tsv)
+          if [[ -z "$VERSION" || "$VERSION" == "None" ]]; then
+            echo "::error::No published versions under ${GALLERY_NAME}/${IMAGE_NAME}"; exit 1
+          fi
+          echo "Version: $VERSION"
+          # Only emit the short version number — see canary-linux for rationale.
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Exclude new version from 'latest' until canary passes
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-windows.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-windows.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          az sig image-version update \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" -e "$VERSION" \
+            --set publishingProfile.excludeFromLatest=true \
+            --output none
+      - name: Create throwaway canary VM
+        id: vm
+        env:
+          CANARY_SUBNET_INPUT: ${{ inputs.canary_subnet_id }}
+          ADMIN_PASSWORD: ${{ secrets.VMSS_WINDOWS_ADMIN_PASSWORD }}
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-windows.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-windows.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          VER_ID="/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/galleries/${GALLERY_NAME}/images/${IMAGE_NAME}/versions/${VERSION}"
+          SUBNET="$CANARY_SUBNET_INPUT"
+          if [[ -z "$SUBNET" ]]; then
+            SUBNET=$(az network vnet list \
+              --resource-group "${{ vars.RESOURCE_GROUP }}" \
+              --query "[?subnets[?name=='snet-vmss']] | [0].subnets[?name=='snet-vmss'] | [0].id" \
+              -o tsv 2>/dev/null || true)
+          fi
+          if [[ -z "$SUBNET" ]]; then
+            echo "::error::Could not resolve canary subnet. Pass canary_subnet_id, or deploy VMSS stack first."
+            exit 1
+          fi
+          if [[ -z "$ADMIN_PASSWORD" ]]; then
+            # Generate a random one-shot password if the secret is not provided;
+            # the canary VM is deleted at the end of the job regardless.
+            ADMIN_PASSWORD="Canary!$(openssl rand -base64 18 | tr -d '/=+' | head -c24)A1"
+          fi
+          echo "::add-mask::${ADMIN_PASSWORD}"
+          VM_NAME="canary-win-${GITHUB_RUN_ID}"
+          # Azure VM names on Windows are truncated to 15 chars for computerName.
+          SHORT_NAME="${VM_NAME:0:15}"
+          echo "vm_name=$VM_NAME"        >> "$GITHUB_OUTPUT"
+          echo "short_name=$SHORT_NAME"  >> "$GITHUB_OUTPUT"
+          # AIB bakes images with TrustedLaunch security type, so the canary
+          # VM must be created with the same security type or VM creation
+          # fails with: "The provided gallery image only supports creation
+          # of VMs and VM Scale Sets with 'TrustedLaunch' security type."
+          az vm create \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --name "$VM_NAME" \
+            --computer-name "$SHORT_NAME" \
+            --image "$VER_ID" \
+            --size Standard_D4s_v5 \
+            --security-type TrustedLaunch \
+            --enable-secure-boot true \
+            --enable-vtpm true \
+            --admin-username ghrunner \
+            --admin-password "$ADMIN_PASSWORD" \
+            --subnet "$SUBNET" \
+            --public-ip-address "" \
+            --nsg "" \
+            --tags ghRunnerIdleRetentionMinutes=0 ghRunnerMaxLifetimeHours=1 canary=true runId=${GITHUB_RUN_ID} \
+            --output none
+          echo "Canary VM created: $VM_NAME (computerName $SHORT_NAME)"
+      - name: Mint GitHub App installation token
+        # github.token cannot read self-hosted runners (403); mint an App
+        # installation token so the poll + cleanup steps can query the runner
+        # registry. See canary-linux for the same pattern.
+        id: app_token
+        env:
+          APP_ID: ${{ vars.GH_APP_ID }}
+          INSTALLATION_ID: ${{ vars.GH_INSTALLATION_ID }}
+          APP_PEM_B64: ${{ secrets.GH_APP_PEM_B64 }}
+        run: |
+          set -euo pipefail
+          PEM_FILE="$(mktemp -p "${RUNNER_TEMP:-/tmp}" gh_app.XXXXXX.pem)"
+          trap 'rm -f "$PEM_FILE"' EXIT
+          ( umask 077; printf '%s' "$APP_PEM_B64" | base64 -d > "$PEM_FILE" )
+          now=$(date +%s); iat=$((now - 60)); exp=$((now + 540))
+          b64() { openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
+          header=$(printf '%s' '{"typ":"JWT","alg":"RS256"}' | b64)
+          payload=$(printf '%s' "{\"iat\":${iat},\"exp\":${exp},\"iss\":${APP_ID}}" | b64)
+          signature=$(printf '%s' "${header}.${payload}" | openssl dgst -sha256 -sign "$PEM_FILE" | b64)
+          JWT="${header}.${payload}.${signature}"
+          TOKEN=$(curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${JWT}" \
+            "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
+            | jq -r '.token')
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::Failed to mint GitHub App installation token"
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+      - name: Wait for canary runner to register
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          SHORT_NAME: ${{ steps.vm.outputs.short_name }}
+        run: |
+          set -euo pipefail
+          DEADLINE=$((SECONDS + 1500))   # 25 minutes — Windows boot + bootstrap is slow
+          while (( SECONDS < DEADLINE )); do
+            FOUND=$(gh api "/repos/${{ github.repository }}/actions/runners" --paginate \
+              --jq "[.runners[] | select(.name | ascii_downcase == \"$(echo -n "$SHORT_NAME" | tr 'A-Z' 'a-z')\")] | length")
+            echo "Registered runners matching ${SHORT_NAME}: $FOUND"
+            if [[ "$FOUND" -ge 1 ]]; then
+              echo "Canary runner registered — image is good"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error title=Canary failed::Windows image version ${{ steps.ver.outputs.version }} did not produce a registered runner within 25m"
+          exit 1
+      - name: Promote canary version (clear excludeFromLatest)
+        if: success()
+        env:
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RG: ${{ vars.RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ needs.bake-windows.outputs.gallery_name }}
+          IMAGE_NAME: ${{ needs.bake-windows.outputs.image_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          az sig image-version update \
+            -g "$RG" -r "$GALLERY_NAME" -i "$IMAGE_NAME" -e "$VERSION" \
+            --set publishingProfile.excludeFromLatest=false \
+            --output none
+          echo "Promoted ${VERSION} to latest"
+      - name: Delete canary VM (always)
+        if: always() && steps.vm.outputs.vm_name != ''
+        env:
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          set -euo pipefail
+          echo "Deleting canary VM ${VM_NAME}…"
+          az vm delete --resource-group "${{ vars.RESOURCE_GROUP }}" --name "$VM_NAME" --yes --output none || true
+          for r in $(az resource list -g "${{ vars.RESOURCE_GROUP }}" --query "[?starts_with(name, '${VM_NAME}')].id" -o tsv); do
+            echo "Deleting residual resource: $r"
+            az resource delete --ids "$r" --output none || true
+          done
+      - name: Deregister canary runner (always)
+        if: always()
+        env:
+          # Use the GitHub App installation token (github.token gets 403 on
+          # /actions/runners). Token may be empty if the mint step failed or
+          # was skipped — the early-exit + `|| true` keeps cleanup best-effort.
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          SHORT_NAME: ${{ steps.vm.outputs.short_name }}
+        run: |
+          set -euo pipefail
+          [[ -z "$SHORT_NAME" ]] && exit 0
+          [[ -z "${GH_TOKEN:-}" ]] && { echo "App token unavailable; skipping runner deregistration"; exit 0; }
+          IDS=$(gh api "/repos/${{ github.repository }}/actions/runners" --paginate \
+            --jq ".runners[] | select(.name | ascii_downcase == \"$(echo -n "$SHORT_NAME" | tr 'A-Z' 'a-z')\") | .id" 2>/dev/null || true)
+          for id in $IDS; do
+            echo "Deleting leftover runner id=$id"
+            gh api -X DELETE "/repos/${{ github.repository }}/actions/runners/${id}" || true
+          done

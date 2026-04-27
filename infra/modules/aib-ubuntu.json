@@ -1,0 +1,174 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "17959451230008933325"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Name of the AIB image template resource."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region. Must match the region of the build identity and the target Compute Gallery."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags applied to the image template."
+      }
+    },
+    "buildIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the user-assigned managed identity AIB runs as. This identity must have Contributor on the staging RG and Image Contributor (or equivalent) on the target Compute Gallery. Created outside this module (see identity.bicep)."
+      }
+    },
+    "imageDefinitionId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the Shared Image Gallery image definition that AIB distributes into (e.g. /subscriptions/.../galleries/<g>/images/<def>). No version suffix — AIB auto-generates a new version per run."
+      }
+    },
+    "stagingResourceGroup": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Explicit staging resource group resource ID where AIB creates its ephemeral build VM, or an empty string to let AIB generate one automatically (named IT_<rg>_<template>_<guid>). The caller-supplied RG must exist and the build identity must have Contributor on it."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4ds_v5",
+      "metadata": {
+        "description": "VM size used by AIB for the build VM. Must be a size with a resource disk (d-series) large enough to hold the ~40 GB baked image during capture. D4ds_v5 has a 150 GB cache disk — sufficient headroom."
+      }
+    },
+    "buildTimeoutMinutes": {
+      "type": "int",
+      "defaultValue": 240,
+      "minValue": 60,
+      "maxValue": 960,
+      "metadata": {
+        "description": "AIB build timeout in minutes. Upstream runner-images Ubuntu bake typically takes 90-150 minutes; 240 gives headroom for transient apt slowness."
+      }
+    },
+    "osDiskSizeGB": {
+      "type": "int",
+      "defaultValue": 50,
+      "minValue": 30,
+      "maxValue": 1023,
+      "metadata": {
+        "description": "OS disk size in GB for the build VM. 50 GB covers Ubuntu 22.04 + runner-images tool set with margin."
+      }
+    },
+    "runnerImagesCommit": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Commit SHA of actions/runner-images to check out for the bake. MUST be a full 40-character SHA — no branches, tags, or short SHAs — so the image is reproducible. The deploy pipeline / Dependabot bumps this; there is no safe default, so builds will fail fast if left empty."
+      }
+    },
+    "bakeTimestamp": {
+      "type": "string",
+      "defaultValue": "[utcNow('yyyyMMdd.HHmm')]",
+      "metadata": {
+        "description": "Timestamp captured once at deploy time for artifact tagging. Format: yyyyMMdd.HHmm. Do not override — default computes at deployment."
+      }
+    }
+  },
+  "variables": {
+    "runnerImagesRepo": "https://github.com/actions/runner-images.git",
+    "runOutputName": "ubuntu-2204",
+    "installRunnerImagesScript": "set -euxo pipefail\r\nif [ -z \"${RUNNER_IMAGES_COMMIT:-}\" ]; then\r\n  echo \"runnerImagesCommit parameter must be set to a full 40-char SHA\" >&2\r\n  exit 1\r\nfi\r\nexport DEBIAN_FRONTEND=noninteractive\r\napt-get update\r\napt-get install -y --no-install-recommends git ca-certificates curl\r\ngit clone --no-checkout ${RUNNER_IMAGES_REPO} /opt/runner-images\r\ncd /opt/runner-images\r\ngit -c advice.detachedHead=false checkout ${RUNNER_IMAGES_COMMIT}\r\nexport IMAGE_FOLDER=/opt/runner-images/images/ubuntu\r\nexport INSTALLER_SCRIPT_FOLDER=${IMAGE_FOLDER}/scripts/build\r\nexport HELPER_SCRIPTS=${IMAGE_FOLDER}/scripts/helpers\r\nexport AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\r\nmkdir -p \"${AGENT_TOOLSDIRECTORY}\"\r\nchmod -R 777 \"${AGENT_TOOLSDIRECTORY}\"\r\nfor script in $(ls \"${INSTALLER_SCRIPT_FOLDER}\"/*.sh | sort); do\r\n  echo \"=== running ${script} ===\"\r\n  bash \"${script}\"\r\ndone\r\n",
+    "preRunnerBinaryScript": "set -euxo pipefail\r\nmkdir -p /opt\r\ncat > /opt/actions-runner-version <<EOF\r\nrunner-images-commit=${RUNNER_IMAGES_COMMIT}\r\nbake-timestamp=${BAKE_TIMESTAMP}\r\nEOF\r\nchmod 0644 /opt/actions-runner-version\r\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.VirtualMachineImages/imageTemplates",
+      "apiVersion": "2024-02-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', parameters('buildIdentityId'))]": {}
+        }
+      },
+      "properties": {
+        "buildTimeoutInMinutes": "[parameters('buildTimeoutMinutes')]",
+        "vmProfile": {
+          "vmSize": "[parameters('vmSize')]",
+          "osDiskSizeGB": "[parameters('osDiskSizeGB')]"
+        },
+        "stagingResourceGroup": "[parameters('stagingResourceGroup')]",
+        "source": {
+          "type": "PlatformImage",
+          "publisher": "Canonical",
+          "offer": "0001-com-ubuntu-server-jammy",
+          "sku": "22_04-lts-gen2",
+          "version": "latest"
+        },
+        "customize": [
+          {
+            "type": "Shell",
+            "name": "install-runner-images-tools",
+            "inline": [
+              "[format('export RUNNER_IMAGES_REPO=\"{0}\"', variables('runnerImagesRepo'))]",
+              "[format('export RUNNER_IMAGES_COMMIT=\"{0}\"', parameters('runnerImagesCommit'))]",
+              "[variables('installRunnerImagesScript')]"
+            ]
+          },
+          {
+            "type": "Shell",
+            "name": "pre-pull-runner-binary",
+            "inline": [
+              "[format('export RUNNER_IMAGES_COMMIT=\"{0}\"', parameters('runnerImagesCommit'))]",
+              "[format('export BAKE_TIMESTAMP=\"{0}\"', parameters('bakeTimestamp'))]",
+              "[variables('preRunnerBinaryScript')]"
+            ]
+          }
+        ],
+        "distribute": [
+          {
+            "type": "SharedImage",
+            "galleryImageId": "[parameters('imageDefinitionId')]",
+            "runOutputName": "[variables('runOutputName')]",
+            "replicationRegions": [
+              "[parameters('location')]"
+            ],
+            "excludeFromLatest": false,
+            "artifactTags": {
+              "runnerImagesCommit": "[parameters('runnerImagesCommit')]",
+              "bakeTimestamp": "[parameters('bakeTimestamp')]",
+              "os": "ubuntu-22.04"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "imageTemplateId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.VirtualMachineImages/imageTemplates', parameters('name'))]"
+    },
+    "imageTemplateName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    }
+  }
+}

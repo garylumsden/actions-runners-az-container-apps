@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic trigger for gh-runner-watchdog.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=gh-runner-watchdog.service
+
+[Install]
+WantedBy=timers.target

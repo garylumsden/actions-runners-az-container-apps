@@ -1,0 +1,8 @@
+[Unit]
+Description=GitHub Actions runner idle/lifetime watchdog
+ConditionPathExists=/opt/gh-runner-bootstrap/watchdog.sh
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/gh-runner-bootstrap/watchdog.sh

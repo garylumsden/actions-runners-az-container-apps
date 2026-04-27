@@ -1,0 +1,278 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      whatIf:
+        description: 'Run in what-if mode only (no changes deployed)'
+        type: boolean
+        default: false
+      enableVmssLinux:
+        description: 'Enable the vmss-linux runner tier'
+        type: boolean
+        default: false
+      enableVmssWindows:
+        description: 'Enable the vmss-windows runner tier'
+        type: boolean
+        default: false
+      enableAibUbuntu:
+        description: 'Enable Ubuntu AIB template (bake gallery image) without VMSS tier. Defaults to enableVmssLinux when empty.'
+        type: boolean
+        default: false
+      enableAibWindows:
+        description: 'Enable Windows AIB template (bake gallery image) without VMSS tier. Defaults to enableVmssWindows when empty.'
+        type: boolean
+        default: false
+      vmssLinuxIdleRetentionMinutes:
+        description: 'vmss-linux: idle retention window in minutes (0 = 1:1 ephemeral)'
+        type: number
+        default: 60
+      vmssWindowsIdleRetentionMinutes:
+        description: 'vmss-windows: idle retention window in minutes (0 = 1:1 ephemeral)'
+        type: number
+        default: 60
+      vmssLinuxMaxLifetimeHours:
+        description: 'vmss-linux: hard recycle cap in hours (0 = no cap)'
+        type: number
+        default: 12
+      vmssWindowsMaxLifetimeHours:
+        description: 'vmss-windows: hard recycle cap in hours (0 = no cap)'
+        type: number
+        default: 12
+      vmssLinuxMaxLifetimeMinutes:
+        description: 'vmss-linux: optional sub-hour recycle cap in minutes; >0 overrides vmssLinuxMaxLifetimeHours (primarily for CI). 0 = fall through to hours.'
+        type: number
+        default: 0
+      vmssWindowsMaxLifetimeMinutes:
+        description: 'vmss-windows: optional sub-hour recycle cap in minutes; >0 overrides vmssWindowsMaxLifetimeHours. 0 = fall through to hours.'
+        type: number
+        default: 0
+      vmssRunnerLabelSuffix:
+        description: 'Optional suffix appended to VMSS runner labels for tenancy / test isolation (e.g. "test-123"). Empty = unchanged.'
+        type: string
+        default: ''
+      vmssLinuxAdminSshPublicKey:
+        description: 'Optional SSH public key for the vmss-linux admin user. Empty (default) = deploy.yml auto-generates a throwaway keypair when enableVmssLinux is true. Supply a value to override auto-generation (e.g. for reproducible CI or bring-your-own-key).'
+        type: string
+        default: ''
+
+permissions:
+  id-token: write   # required for OIDC token exchange with Azure
+  contents: read
+
+# Prevent concurrent deploys; queue a new one rather than cancel, to avoid partial state.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Bicep
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      id-token: write   # OIDC token exchange with Azure
+      contents: read
+      actions: write    # required by the "Trigger image build" step to dispatch build-images.yml
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # OIDC login — no client secret stored anywhere.
+      # Requires federated credentials configured by scripts/setup-oidc.ps1.
+      - name: Mask sensitive variables
+        run: |
+          echo "::add-mask::${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          echo "::add-mask::${{ vars.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ vars.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ vars.RESOURCE_GROUP }}"
+
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists
+        run: |
+          az group create \
+            --name     ${{ vars.RESOURCE_GROUP }} \
+            --location ${{ vars.AZURE_LOCATION }} \
+            --output none
+
+      # Clean up legacy RG-scoped role assignments on the runner UAMI that existed before
+      # issue #14 narrowed the identity scope. Done here (not in Bicep) because the
+      # subscription blocks key-based storage auth, which deploymentScripts require.
+      # Safe to run every deploy: az role assignment delete is idempotent; no-op if there
+      # is no matching assignment or the UAMI does not yet exist.
+      - name: Cleanup legacy role assignments
+        if: ${{ inputs.whatIf != true }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          RG_ID=$(az group show --name "${{ vars.RESOURCE_GROUP }}" --query id -o tsv)
+          # Enumerate ALL runner UAMIs deterministically by exact name prefix
+          # (matches naming in main.bicep: id-runner-${baseName}). Sorted for
+          # stable iteration order. Tolerate no matches on first-time deploy.
+          PRINCIPAL_IDS=$(az identity list \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "sort_by([?starts_with(name, 'id-runner-')], &name)[].principalId" \
+            -o tsv 2>/dev/null || true)
+          if [[ -z "${PRINCIPAL_IDS}" ]]; then
+            echo "No runner UAMI found yet — skipping legacy role cleanup."
+            exit 0
+          fi
+          while IFS= read -r PRINCIPAL_ID; do
+            [[ -z "${PRINCIPAL_ID}" || "${PRINCIPAL_ID}" == "null" ]] && continue
+            echo "::add-mask::${PRINCIPAL_ID}"
+            # Legacy RG-scoped roles from before #14 narrowed scope.
+            for ROLE_ID in \
+              b24988ac-6180-42a0-ab88-20f7382dd24c \
+              7f951dda-4ed3-4680-a7ca-43fe172d538d \
+              5d977122-f97e-4b4d-a52f-6b43003ddb4d; do
+              IDS=$(az role assignment list \
+                --assignee "${PRINCIPAL_ID}" \
+                --role     "${ROLE_ID}" \
+                --scope    "${RG_ID}" \
+                --query "[].id" -o tsv 2>/dev/null || true)
+              if [[ -n "${IDS}" ]]; then
+                while IFS= read -r ID; do
+                  [[ -z "${ID}" ]] && continue
+                  echo "Removing legacy role ${ROLE_ID}: ${ID}"
+                  az role assignment delete --ids "${ID}" || echo "WARN: delete failed, continuing."
+                done <<< "${IDS}"
+              fi
+            done
+          done <<< "${PRINCIPAL_IDS}"
+          echo "Legacy role cleanup complete."
+
+      # Assemble VMSS-related --parameters only when at least one VMSS tier is enabled.
+      # This keeps default deploys (push to main / dispatch without VMSS flags) unchanged
+      # and avoids tripping _assertVmssLinuxHasSshKey in main.bicep when the SSH key
+      # and subnet inputs are legitimately empty.
+      - name: Build VMSS deployment parameters
+        id: vmss_params
+        env:
+          ENABLE_VMSS_LINUX: ${{ inputs.enableVmssLinux || false }}
+          ENABLE_VMSS_WINDOWS: ${{ inputs.enableVmssWindows || false }}
+          ENABLE_AIB_UBUNTU: ${{ inputs.enableAibUbuntu || false }}
+          ENABLE_AIB_WINDOWS: ${{ inputs.enableAibWindows || false }}
+          VMSS_LINUX_IDLE: ${{ inputs.vmssLinuxIdleRetentionMinutes || 60 }}
+          VMSS_WINDOWS_IDLE: ${{ inputs.vmssWindowsIdleRetentionMinutes || 60 }}
+          VMSS_LINUX_MAX_LIFETIME: ${{ inputs.vmssLinuxMaxLifetimeHours || 12 }}
+          VMSS_WINDOWS_MAX_LIFETIME: ${{ inputs.vmssWindowsMaxLifetimeHours || 12 }}
+          VMSS_LINUX_MAX_LIFETIME_MIN: ${{ inputs.vmssLinuxMaxLifetimeMinutes || 0 }}
+          VMSS_WINDOWS_MAX_LIFETIME_MIN: ${{ inputs.vmssWindowsMaxLifetimeMinutes || 0 }}
+          VMSS_RUNNER_LABEL_SUFFIX: ${{ inputs.vmssRunnerLabelSuffix }}
+          VMSS_LINUX_ADMIN_SSH_PUBLIC_KEY: ${{ inputs.vmssLinuxAdminSshPublicKey }}
+        run: |
+          set -euo pipefail
+          VMSS_ARGS=""
+          if [[ "${ENABLE_VMSS_LINUX}" == "true" || "${ENABLE_VMSS_WINDOWS}" == "true" || "${ENABLE_AIB_UBUNTU}" == "true" || "${ENABLE_AIB_WINDOWS}" == "true" ]]; then
+            VMSS_ARGS="enableVmssLinux=${ENABLE_VMSS_LINUX}"
+            VMSS_ARGS="${VMSS_ARGS} enableVmssWindows=${ENABLE_VMSS_WINDOWS}"
+            VMSS_ARGS="${VMSS_ARGS} enableAibUbuntu=${ENABLE_AIB_UBUNTU}"
+            VMSS_ARGS="${VMSS_ARGS} enableAibWindows=${ENABLE_AIB_WINDOWS}"
+            VMSS_ARGS="${VMSS_ARGS} vmssLinuxIdleRetentionMinutes=${VMSS_LINUX_IDLE}"
+            VMSS_ARGS="${VMSS_ARGS} vmssWindowsIdleRetentionMinutes=${VMSS_WINDOWS_IDLE}"
+            VMSS_ARGS="${VMSS_ARGS} vmssLinuxMaxLifetimeHours=${VMSS_LINUX_MAX_LIFETIME}"
+            VMSS_ARGS="${VMSS_ARGS} vmssWindowsMaxLifetimeHours=${VMSS_WINDOWS_MAX_LIFETIME}"
+            VMSS_ARGS="${VMSS_ARGS} vmssLinuxMaxLifetimeMinutes=${VMSS_LINUX_MAX_LIFETIME_MIN}"
+            VMSS_ARGS="${VMSS_ARGS} vmssWindowsMaxLifetimeMinutes=${VMSS_WINDOWS_MAX_LIFETIME_MIN}"
+            if [[ "${ENABLE_VMSS_LINUX}" == "true" ]]; then
+              if [[ -n "${VMSS_LINUX_ADMIN_SSH_PUBLIC_KEY}" ]]; then
+                # Operator-supplied SSH public key — use it verbatim instead of
+                # auto-generating a throwaway one. Still mask the value in logs.
+                SSH_KEY="${VMSS_LINUX_ADMIN_SSH_PUBLIC_KEY}"
+                echo "::add-mask::${SSH_KEY}"
+              else
+                # Generate a throwaway SSH keypair for the vmss-linux admin user.
+                # The private key is discarded at the end of this step; the public
+                # key is masked in logs, passed to Bicep as a @secure() param, and
+                # never stored anywhere persistent. Admin access (if ever needed)
+                # goes via `az vmss run-command invoke` / serial console — no
+                # direct SSH. Loss of the private key is irrelevant: you'd reset
+                # via another deploy.
+                KEYFILE="$(mktemp -u -p "${RUNNER_TEMP:-/tmp}" vmss_key.XXXXXX)"
+                ssh-keygen -t rsa -b 4096 -N '' -C 'vmss-linux-throwaway' -f "${KEYFILE}" -q
+                SSH_KEY="$(cat "${KEYFILE}.pub")"
+                echo "::add-mask::${SSH_KEY}"
+                rm -f "${KEYFILE}" "${KEYFILE}.pub"
+              fi
+              # SSH public key contains spaces ("ssh-rsa AAAA... comment"). Single-quote
+              # the value so that when $VMSS_ARGS is substituted into the az CLI command
+              # line, the shell treats the key as one argument and not three.
+              VMSS_ARGS="${VMSS_ARGS} vmssLinuxAdminSshPublicKey='${SSH_KEY}'"
+            fi
+            if [[ -n "${VMSS_RUNNER_LABEL_SUFFIX}" ]]; then
+              VMSS_ARGS="${VMSS_ARGS} vmssRunnerLabelSuffix=${VMSS_RUNNER_LABEL_SUFFIX}"
+            fi
+          fi
+          # Use a heredoc delimiter to safely carry the (possibly empty) string through $GITHUB_OUTPUT.
+          {
+            echo "args<<__VMSS_EOF__"
+            echo "${VMSS_ARGS}"
+            echo "__VMSS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: What-if preview
+        if: ${{ inputs.whatIf == true }}
+        run: |
+          az deployment group what-if \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             ${{ steps.vmss_params.outputs.args }}
+
+      - name: Deploy
+        if: ${{ inputs.whatIf != true }}
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment group create \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --template-file  infra/main.bicep \
+            --parameters     infra/main.bicepparam \
+            --parameters     githubAppId='${{ vars.GH_APP_ID }}' \
+                             githubInstallationId='${{ vars.GH_INSTALLATION_ID }}' \
+                             githubAppPemB64='${{ secrets.GH_APP_PEM_B64 }}' \
+                             ${{ steps.vmss_params.outputs.args }} \
+            --query          properties.outputs \
+            --output         json)
+          ACR_NAME=$(echo "$OUTPUT" | jq -er '.acrName.value') || {
+            echo "::error::Bicep output did not contain a non-null 'acrName' value"; exit 1; }
+          # Mask the value before any later echo or validation message can print it.
+          echo "::add-mask::${ACR_NAME}"
+          if [[ ! "$ACR_NAME" =~ ^cr[a-z0-9]+$ ]]; then
+            echo "::error::Extracted ACR name does not match expected pattern ^cr[a-z0-9]+$"
+            exit 1
+          fi
+          echo "acrName=${ACR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Deployment complete."
+
+      # Note: we deliberately do NOT write ACR_NAME as a GitHub Actions variable.
+      # The default GITHUB_TOKEN cannot write Actions variables at either repo or
+      # org scope (HTTP 403: "Resource not accessible by integration"), and there
+      # is no `variables: write` workflow permission. build-images.yml discovers
+      # the ACR dynamically via `az acr list`, so the variable is not needed.
+      # If a stored value is ever required, provision a PAT/App token secret.
+
+      - name: Trigger image build
+        if: ${{ inputs.whatIf != true }}
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh workflow run build-images.yml --ref main; then
+            echo "::error::Failed to dispatch build-images workflow"
+            exit 1
+          fi
+          echo "build-images.yml triggered."

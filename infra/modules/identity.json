@@ -1,0 +1,301 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "12269183431401367606"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the identities."
+      }
+    },
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "Base name used for both identities. The runner uses this name as-is; the launcher appends \"-launcher\"."
+      }
+    },
+    "acrName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the ACR instance. AcrPull is scoped to this resource (not the resource group) to respect least privilege — issue #14."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "enableVmss": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Feature flag: create the VMSS launcher UAMI and its role assignments. Defaults to false so existing deploys are byte-for-byte identical."
+      }
+    },
+    "enableAib": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Feature flag: create the Azure Image Builder (AIB) UAMI and its role assignments. Defaults to false so existing deploys are byte-for-byte identical."
+      }
+    },
+    "vmssResourceIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Resource IDs of the VMSS instances the vmssLauncher must manage. Role assignments are scoped to each VMSS (not the RG) for least privilege. Populated by main.bicep after the VMSS modules are created."
+      }
+    },
+    "galleryResourceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Azure Compute Gallery used by AIB. Required when enableAib = true."
+      }
+    },
+    "logAnalyticsResourceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace. Required when enableVmss = true — the vmssLauncher needs Log Analytics Contributor on the workspace to pipe shared keys to new VMSS instances."
+      }
+    },
+    "stagingResourceGroupId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the AIB staging resource group. Currently unused — AIB auto-creates an IT_* staging RG under the subscription, and we cannot pre-create it from RG-scope Bicep. Reserved for a future subscription-scope deployment that provisions a dedicated staging RG and grants the AIB UAMI Contributor on *only* that RG (see issue #97 TODO in the AIB section)."
+      }
+    },
+    "enableRunnerSelfDelete": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Feature flag: grant the runner UAMI Virtual Machine Contributor scoped to each VMSS in vmssResourceIds so a warm VM can self-delete after the idle retention window. Defaults to false (legacy 1:1 ephemeral behaviour)."
+      }
+    }
+  },
+  "variables": {
+    "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+    "containerInstanceContributorRoleId": "5d977122-f97e-4b4d-a52f-6b43003ddb4d",
+    "managedIdentityOperatorRoleId": "f1a07417-d97a-45cb-824c-7a7467783830",
+    "virtualMachineContributorRoleId": "9980e02c-c2be-4d73-94e8-173b1dc7cf3c",
+    "logAnalyticsContributorRoleId": "92aaf0da-9dab-42b6-94a3-d43ce8d16293",
+    "contributorRoleId": "b24988ac-6180-42a0-ab88-20f7382dd24c"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2024-11-30",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), variables('acrPullRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+        "description": "AcrPull for runner managed identity (scoped to ACR — issue #14)"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2024-11-30",
+      "name": "[format('{0}-launcher', parameters('name'))]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), variables('acrPullRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+        "description": "AcrPull for Windows launcher managed identity (scoped to ACR — issue #14)"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), resourceGroup().id, variables('containerInstanceContributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('containerInstanceContributorRoleId'))]",
+        "description": "Container Instance Contributor on RG — Windows launcher only; runner identity deliberately has nothing here (issue #14)."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]",
+      "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), variables('managedIdentityOperatorRoleId'), 'self')]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('managedIdentityOperatorRoleId'))]",
+        "description": "Managed Identity Operator on self — required for ACI --assign-identity / --acr-identity to succeed (avoids LinkedAuthorizationFailed)."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "launcherVmssVmContributor",
+        "count": "[length(parameters('vmssResourceIds'))]"
+      },
+      "condition": "[parameters('enableVmss')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', last(split(parameters('vmssResourceIds')[copyIndex()], '/')))]",
+      "name": "[guid(parameters('vmssResourceIds')[copyIndex()], 'launcher', variables('virtualMachineContributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('virtualMachineContributorRoleId'))]",
+        "description": "Virtual Machine Contributor for the shared launcher UAMI — scoped to this specific VMSS so the launcher can add/remove instances."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableVmss')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name'))]",
+      "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), 'launcher', variables('managedIdentityOperatorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('managedIdentityOperatorRoleId'))]",
+        "description": "Managed Identity Operator on the runner UAMI — required so the launcher can attach the runner UAMI to new VMSS instances."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableVmss')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.OperationalInsights/workspaces', last(split(parameters('logAnalyticsResourceId'), '/')))]",
+      "name": "[guid(parameters('logAnalyticsResourceId'), 'launcher', variables('logAnalyticsContributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('logAnalyticsContributorRoleId'))]",
+        "description": "Log Analytics Contributor for the shared launcher UAMI — required to listKeys() on the workspace so new VMSS instances can be enrolled in LAW without baking the key into a Bicep secret."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "runnerVmssContributor",
+        "count": "[length(parameters('vmssResourceIds'))]"
+      },
+      "condition": "[parameters('enableRunnerSelfDelete')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', last(split(parameters('vmssResourceIds')[copyIndex()], '/')))]",
+      "name": "[guid(parameters('vmssResourceIds')[copyIndex()], 'runner-self-delete', variables('virtualMachineContributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('virtualMachineContributorRoleId'))]",
+        "description": "Virtual Machine Contributor for runner UAMI — scoped to this VMSS so a warm VM can self-delete after idle retention expires."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableAib')]",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2024-11-30",
+      "name": "[format('id-{0}-aib', parameters('name'))]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+    {
+      "condition": "[parameters('enableAib')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Compute/galleries', last(split(parameters('galleryResourceId'), '/')))]",
+      "name": "[guid(parameters('galleryResourceId'), 'aib', variables('contributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-aib', parameters('name'))), '2024-11-30').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('contributorRoleId'))]",
+        "description": "Contributor on the Compute Gallery — AIB publishes image versions here. Built-in Contributor used because Azure has no narrower gallery-image-publish built-in role. Replaces the prior RG-wide assignment (issue #97)."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-aib', parameters('name')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "runnerId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name'))]"
+    },
+    "runnerPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), '2024-11-30').principalId]"
+    },
+    "runnerClientId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('name')), '2024-11-30').clientId]"
+    },
+    "launcherId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name')))]"
+    },
+    "launcherPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').principalId]"
+    },
+    "launcherClientId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-launcher', parameters('name'))), '2024-11-30').clientId]"
+    },
+    "aibId": {
+      "type": "string",
+      "value": "[if(parameters('enableAib'), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-aib', parameters('name'))), '')]"
+    },
+    "aibPrincipalId": {
+      "type": "string",
+      "value": "[if(parameters('enableAib'), reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-aib', parameters('name'))), '2024-11-30').principalId, '')]"
+    }
+  }
+}

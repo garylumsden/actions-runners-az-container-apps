@@ -1,0 +1,336 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "15977573489388218234"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource name for the ACA Job."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "runnerOs": {
+      "type": "string",
+      "allowedValues": [
+        "linux",
+        "windows"
+      ],
+      "metadata": {
+        "description": "OS flavour of the target VMSS — used only to shape KEDA labels and log markers. The launcher image is OS-agnostic."
+      }
+    },
+    "vmssName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the VMSS this launcher scales. Passed to the container as VMSS_NAME."
+      }
+    },
+    "containerAppEnvironmentId": {
+      "type": "string",
+      "metadata": {
+        "description": "Container Apps environment resource ID."
+      }
+    },
+    "acrLoginServer": {
+      "type": "string",
+      "metadata": {
+        "description": "ACR login server (e.g. crxxx.azurecr.io)."
+      }
+    },
+    "imageTag": {
+      "type": "string",
+      "defaultValue": "stable",
+      "metadata": {
+        "description": "Image tag for the vmss-launcher image in ACR. Defaults to \"stable\"."
+      }
+    },
+    "launcherIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the launcher user-assigned managed identity. Must have Virtual Machine Contributor on the target VMSS, Managed Identity Operator on itself and on the runner UAMI, Log Analytics Contributor on the workspace, and AcrPull on the ACR."
+      }
+    },
+    "launcherIdentityClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Client ID of the launcher user-assigned managed identity (used by `az login --identity`)."
+      }
+    },
+    "runnerIdentityResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the runner user-assigned managed identity. Assigned to each VMSS instance the launcher creates."
+      }
+    },
+    "keyVaultUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "Key Vault base URL (https://<vault>.vault.azure.net). Required by the ACA Job secret reference (keyVaultUrl must be the versionless secret URI, not the vault URL; kept for parity with other launcher modules)."
+      }
+    },
+    "pemSecretUri": {
+      "type": "string",
+      "metadata": {
+        "description": "Versionless Key Vault secret URI for the base64-encoded GitHub App PEM. The ACA Job resolves this at replica start via the launcher identity (requires Key Vault Secrets User on the vault)."
+      }
+    },
+    "logAnalyticsWorkspaceResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the Log Analytics workspace. Used to resolve listKeys() at deploy time so the launcher entrypoint can enrol new VMSS instances in the same workspace."
+      }
+    },
+    "githubAppPemB64": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Base64-encoded PEM of the GitHub App private key. Decoded inline at deploy time for the KEDA github-runner scaler (which requires raw PEM for its appKey trigger parameter). The KV-backed secret is still used by the launcher entrypoint."
+      }
+    },
+    "runnerScope": {
+      "type": "string",
+      "defaultValue": "org",
+      "allowedValues": [
+        "org",
+        "repo"
+      ],
+      "metadata": {
+        "description": "Runner scope (\"org\" or \"repo\"). Controls which GitHub registration-token endpoint is used and which KEDA scaler metadata is emitted."
+      }
+    },
+    "githubOrg": {
+      "type": "string",
+      "metadata": {
+        "description": "GitHub owner login (organisation or user)."
+      }
+    },
+    "githubRepo": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "GitHub repository name. Required when runnerScope = \"repo\"."
+      }
+    },
+    "githubAppId": {
+      "type": "string",
+      "metadata": {
+        "description": "GitHub App ID (numeric string)."
+      }
+    },
+    "githubInstallationId": {
+      "type": "string",
+      "metadata": {
+        "description": "GitHub App installation ID (numeric string)."
+      }
+    },
+    "maxExecutions": {
+      "type": "int",
+      "defaultValue": 10,
+      "metadata": {
+        "description": "Maximum concurrent launcher executions per KEDA polling interval."
+      }
+    }
+  },
+  "variables": {
+    "isLinux": "[equals(parameters('runnerOs'), 'linux')]",
+    "runnerLabels": "[if(variables('isLinux'), 'self-hosted,linux,vmss', 'self-hosted,windows,vmss')]",
+    "pollingInterval": "[if(variables('isLinux'), 30, 60)]",
+    "isOrgScope": "[equals(parameters('runnerScope'), 'org')]",
+    "runnerRegistrationUrl": "[if(variables('isOrgScope'), format('https://github.com/{0}', parameters('githubOrg')), format('https://github.com/{0}/{1}', parameters('githubOrg'), parameters('githubRepo')))]",
+    "registrationTokenApiUrl": "[if(variables('isOrgScope'), format('https://api.github.com/orgs/{0}/actions/runners/registration-token', parameters('githubOrg')), format('https://api.github.com/repos/{0}/{1}/actions/runners/registration-token', parameters('githubOrg'), parameters('githubRepo')))]",
+    "kedaBaseMetadata": {
+      "githubAPIURL": "https://api.github.com",
+      "owner": "[parameters('githubOrg')]",
+      "runnerScope": "[parameters('runnerScope')]",
+      "targetWorkflowQueueLength": "1",
+      "labels": "[variables('runnerLabels')]",
+      "applicationID": "[parameters('githubAppId')]",
+      "installationID": "[parameters('githubInstallationId')]"
+    },
+    "kedaMetadata": "[if(variables('isOrgScope'), variables('kedaBaseMetadata'), union(variables('kedaBaseMetadata'), createObject('repos', parameters('githubRepo'))))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/jobs",
+      "apiVersion": "2025-07-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', parameters('launcherIdentityId'))]": {}
+        }
+      },
+      "properties": {
+        "environmentId": "[parameters('containerAppEnvironmentId')]",
+        "configuration": {
+          "triggerType": "Event",
+          "replicaTimeout": 900,
+          "replicaRetryLimit": 0,
+          "secrets": [
+            {
+              "name": "github-app-pem",
+              "keyVaultUrl": "[parameters('pemSecretUri')]",
+              "identity": "[parameters('launcherIdentityId')]"
+            },
+            {
+              "name": "github-app-pem-decoded",
+              "value": "[base64ToString(parameters('githubAppPemB64'))]"
+            },
+            {
+              "name": "law-shared-key",
+              "value": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', last(split(parameters('logAnalyticsWorkspaceResourceId'), '/'))), '2025-02-01').primarySharedKey]"
+            }
+          ],
+          "registries": [
+            {
+              "server": "[parameters('acrLoginServer')]",
+              "identity": "[parameters('launcherIdentityId')]"
+            }
+          ],
+          "eventTriggerConfig": {
+            "replicaCompletionCount": 1,
+            "parallelism": 1,
+            "scale": {
+              "minExecutions": 0,
+              "maxExecutions": "[parameters('maxExecutions')]",
+              "pollingInterval": "[variables('pollingInterval')]",
+              "rules": [
+                {
+                  "name": "github-runner-scaler",
+                  "type": "github-runner",
+                  "metadata": "[variables('kedaMetadata')]",
+                  "auth": [
+                    {
+                      "triggerParameter": "appKey",
+                      "secretRef": "github-app-pem-decoded"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "vmss-launcher",
+              "image": "[format('{0}/vmss-launcher:{1}', parameters('acrLoginServer'), parameters('imageTag'))]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "[parameters('launcherIdentityClientId')]"
+                },
+                {
+                  "name": "AZURE_SUBSCRIPTION_ID",
+                  "value": "[subscription().subscriptionId]"
+                },
+                {
+                  "name": "RESOURCE_GROUP",
+                  "value": "[resourceGroup().name]"
+                },
+                {
+                  "name": "VMSS_NAME",
+                  "value": "[parameters('vmssName')]"
+                },
+                {
+                  "name": "RUNNER_OS",
+                  "value": "[parameters('runnerOs')]"
+                },
+                {
+                  "name": "RUNNER_LABELS",
+                  "value": "[variables('runnerLabels')]"
+                },
+                {
+                  "name": "GITHUB_ORG",
+                  "value": "[parameters('githubOrg')]"
+                },
+                {
+                  "name": "GITHUB_REPO",
+                  "value": "[parameters('githubRepo')]"
+                },
+                {
+                  "name": "RUNNER_SCOPE",
+                  "value": "[parameters('runnerScope')]"
+                },
+                {
+                  "name": "GITHUB_APP_ID",
+                  "value": "[parameters('githubAppId')]"
+                },
+                {
+                  "name": "GITHUB_INSTALLATION_ID",
+                  "value": "[parameters('githubInstallationId')]"
+                },
+                {
+                  "name": "GITHUB_APP_PEM_B64",
+                  "secretRef": "github-app-pem"
+                },
+                {
+                  "name": "RUNNER_REGISTRATION_URL",
+                  "value": "[variables('runnerRegistrationUrl')]"
+                },
+                {
+                  "name": "ACCESS_TOKEN_API_URL",
+                  "value": "[format('https://api.github.com/app/installations/{0}/access_tokens', parameters('githubInstallationId'))]"
+                },
+                {
+                  "name": "REGISTRATION_TOKEN_API_URL",
+                  "value": "[variables('registrationTokenApiUrl')]"
+                },
+                {
+                  "name": "KEY_VAULT_URL",
+                  "value": "[parameters('keyVaultUrl')]"
+                },
+                {
+                  "name": "LAW_WORKSPACE_ID",
+                  "value": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', last(split(parameters('logAnalyticsWorkspaceResourceId'), '/'))), '2025-02-01').customerId]"
+                },
+                {
+                  "name": "LAW_SHARED_KEY",
+                  "secretRef": "law-shared-key"
+                },
+                {
+                  "name": "RUNNER_IDENTITY_RESOURCE_ID",
+                  "value": "[parameters('runnerIdentityResourceId')]"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "jobId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.App/jobs', parameters('name'))]"
+    },
+    "jobName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    }
+  }
+}

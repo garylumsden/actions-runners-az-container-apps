@@ -1,0 +1,167 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "6292322069076902430"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Key Vault name. Must be 3-24 chars, lowercase alphanumeric + hyphens, globally unique."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "githubAppPemB64": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Base64-encoded PEM private key for the GitHub App. Stored as-is in Key Vault; container entrypoints decode at runtime."
+      }
+    },
+    "runnerPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Principal ID of the runner managed identity. Granted Key Vault Secrets User on this vault."
+      }
+    },
+    "launcherPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Principal ID of the Windows launcher managed identity. Granted Key Vault Secrets User on this vault."
+      }
+    },
+    "publicNetworkAccess": {
+      "type": "string",
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Key Vault public network access. Set to \"Disabled\" to require private endpoint access only. Default is \"Enabled\" (combined with defaultAction=Deny and bypass=AzureServices this still restricts public traffic unless explicit ipRules/vnetRules are supplied)."
+      }
+    },
+    "ipRules": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Optional public IP allow-list for the Key Vault firewall. Each entry is an IP or CIDR (e.g. {value: \"203.0.113.5\"} or {value: \"203.0.113.0/24\"}). Empty by default — only trusted Azure services (bypass=AzureServices) can reach the vault over the public endpoint."
+      }
+    },
+    "virtualNetworkRules": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Optional VNet subnet allow-list for the Key Vault firewall. Each entry takes the form {id: \"<subnetResourceId>\"}. Empty by default."
+      }
+    }
+  },
+  "variables": {
+    "keyVaultSecretsUserRoleId": "4633458b-17de-408a-b874-0445c86b69e6"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2024-11-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "tenantId": "[subscription().tenantId]",
+        "sku": {
+          "family": "A",
+          "name": "standard"
+        },
+        "enableRbacAuthorization": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": 90,
+        "enablePurgeProtection": true,
+        "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+        "networkAcls": {
+          "bypass": "AzureServices",
+          "defaultAction": "Deny",
+          "ipRules": "[parameters('ipRules')]",
+          "virtualNetworkRules": "[parameters('virtualNetworkRules')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2024-11-01",
+      "name": "[format('{0}/{1}', parameters('name'), 'gh-app-pem-b64')]",
+      "properties": {
+        "value": "[parameters('githubAppPemB64')]",
+        "contentType": "text/plain; base64-encoded PEM"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('name')), parameters('runnerPrincipalId'), variables('keyVaultSecretsUserRoleId'))]",
+      "properties": {
+        "principalId": "[parameters('runnerPrincipalId')]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('keyVaultSecretsUserRoleId'))]",
+        "description": "Key Vault Secrets User for Linux runner managed identity — needed for ACA KV-backed secret resolution at replica start."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('name')), parameters('launcherPrincipalId'), variables('keyVaultSecretsUserRoleId'))]",
+      "properties": {
+        "principalId": "[parameters('launcherPrincipalId')]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('keyVaultSecretsUserRoleId'))]",
+        "description": "Key Vault Secrets User for Windows launcher managed identity — needed for ACA KV-backed secret resolution at replica start."
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "keyVaultId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.KeyVault/vaults', parameters('name'))]"
+    },
+    "keyVaultName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "keyVaultUri": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.KeyVault/vaults', parameters('name')), '2024-11-01').vaultUri]"
+    },
+    "pemSecretUri": {
+      "type": "string",
+      "value": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', parameters('name')), '2024-11-01').vaultUri, 'gh-app-pem-b64')]"
+    }
+  }
+}

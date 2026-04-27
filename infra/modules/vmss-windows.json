@@ -1,0 +1,173 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "1940192821336974200"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "name": {
+      "type": "string",
+      "metadata": {
+        "description": "VMSS resource name."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4ds_v5",
+      "metadata": {
+        "description": "VM size. Default Standard_D4ds_v5 — 4 vCPU / 16 GB, supports ephemeral OS on ResourceDisk (~150 GB NVMe, fits the ~127 GB Windows image) and nested virtualisation for WSL2/Hyper-V."
+      }
+    },
+    "imageReferenceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Compute Gallery image reference ID. Can be a specific image version ID (.../versions/{ver}) or an image-definition ID with the \"latest\" alias used by VMSS to pin the newest version."
+      }
+    },
+    "runnerIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "User-assigned managed identity resource ID for the runner VM (used for ACR pull, Key Vault reads, and self-delete on watchdog expiry)."
+      }
+    },
+    "subnetId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional subnet resource ID to attach each VM NIC to. Empty string means no subnet attached."
+      }
+    },
+    "maxInstances": {
+      "type": "int",
+      "defaultValue": 10,
+      "minValue": 0,
+      "maxValue": 1000,
+      "metadata": {
+        "description": "Maximum number of instances the scale set may hold. Scaling is driven externally (launcher job); this is only the upper bound."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "runneradmin",
+      "metadata": {
+        "description": "Admin username for the runner VMs. Ignored beyond initial provisioning; we do not use password login and do not persist credentials."
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "defaultValue": "[newGuid()]",
+      "metadata": {
+        "description": "Admin password. Defaults to newGuid() which means a fresh, never-recorded password is generated at each deploy. Rotation policy: reimage the scale set to invalidate. Never log, never output — the intent is that no human or workflow ever uses this password."
+      }
+    },
+    "customScriptUri": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional HTTPS URI to a CustomScriptExtension payload (PowerShell bootstrap). When empty, no extension is attached — bootstrap is expected to be baked into the AIB image. When non-empty, the extension runs once at first boot."
+      }
+    },
+    "customScriptCommand": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional PowerShell command line to execute with the fetched script. Example: \"powershell -ExecutionPolicy Unrestricted -File bootstrap.ps1\". Required if customScriptUri is provided."
+      }
+    }
+  },
+  "variables": {
+    "hasSubnet": "[not(empty(parameters('subnetId')))]",
+    "hasCustomScript": "[and(not(empty(parameters('customScriptUri'))), not(empty(parameters('customScriptCommand'))))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/virtualMachineScaleSets",
+      "apiVersion": "2024-11-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', parameters('runnerIdentityId'))]": {}
+        }
+      },
+      "sku": {
+        "name": "[parameters('vmSize')]",
+        "capacity": 0
+      },
+      "properties": {
+        "orchestrationMode": "Flexible",
+        "platformFaultDomainCount": 1,
+        "singlePlacementGroup": false,
+        "upgradePolicy": {
+          "mode": "Manual"
+        },
+        "virtualMachineProfile": {
+          "osProfile": {
+            "computerNamePrefix": "ghwin",
+            "adminUsername": "[parameters('adminUsername')]",
+            "adminPassword": "[parameters('adminPassword')]",
+            "windowsConfiguration": {
+              "provisionVMAgent": true,
+              "enableAutomaticUpdates": false
+            }
+          },
+          "storageProfile": {
+            "imageReference": {
+              "id": "[parameters('imageReferenceId')]"
+            },
+            "osDisk": {
+              "createOption": "FromImage",
+              "caching": "ReadOnly",
+              "diffDiskSettings": {
+                "option": "Local",
+                "placement": "ResourceDisk"
+              }
+            }
+          },
+          "securityProfile": {
+            "securityType": "TrustedLaunch",
+            "uefiSettings": {
+              "secureBootEnabled": true,
+              "vTpmEnabled": true
+            }
+          },
+          "networkProfile": "[if(variables('hasSubnet'), createObject('networkApiVersion', '2022-11-01', 'networkInterfaceConfigurations', createArray(createObject('name', format('{0}-nic', parameters('name')), 'properties', createObject('primary', true(), 'ipConfigurations', createArray(createObject('name', 'ipconfig1', 'properties', createObject('subnet', createObject('id', parameters('subnetId')), 'primary', true()))))))), null())]",
+          "extensionProfile": "[if(variables('hasCustomScript'), createObject('extensions', createArray(createObject('name', 'windowsBootstrap', 'properties', createObject('publisher', 'Microsoft.Compute', 'type', 'CustomScriptExtension', 'typeHandlerVersion', '1.10', 'autoUpgradeMinorVersion', true(), 'settings', createObject('fileUris', createArray(parameters('customScriptUri'))), 'protectedSettings', createObject('commandToExecute', parameters('customScriptCommand')))))), null())]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "vmssId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('name'))]"
+    },
+    "vmssName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    },
+    "maxInstances": {
+      "type": "int",
+      "value": "[parameters('maxInstances')]"
+    }
+  }
+}

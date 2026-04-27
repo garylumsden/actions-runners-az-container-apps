@@ -1,0 +1,178 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "7901130411689706755"
+    }
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Name of the AIB image template resource."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region. Must match the region of the build identity and the target Compute Gallery."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags applied to the image template."
+      }
+    },
+    "buildIdentityId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the user-assigned managed identity AIB runs as. This identity must have Contributor on the staging RG and Image Contributor (or equivalent) on the target Compute Gallery. Created outside this module (see identity.bicep)."
+      }
+    },
+    "imageDefinitionId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the Shared Image Gallery image definition that AIB distributes into (e.g. /subscriptions/.../galleries/<g>/images/<def>). No version suffix — AIB auto-generates a new version per run."
+      }
+    },
+    "stagingResourceGroup": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Explicit staging resource group resource ID where AIB creates its ephemeral build VM, or an empty string to let AIB generate one automatically (named IT_<rg>_<template>_<guid>). The caller-supplied RG must exist and the build identity must have Contributor on it."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4ds_v5",
+      "metadata": {
+        "description": "VM size used by AIB for the build VM. Must be a size with a resource disk (d-series) large enough to hold the ~90 GB baked image during capture. D4ds_v5 has a 150 GB cache disk — sufficient for Windows."
+      }
+    },
+    "buildTimeoutMinutes": {
+      "type": "int",
+      "defaultValue": 360,
+      "minValue": 60,
+      "maxValue": 960,
+      "metadata": {
+        "description": "AIB build timeout in minutes. Upstream runner-images Windows 2022 bake typically takes 3-5 hours (Visual Studio workloads, SDK installs); 360 gives margin."
+      }
+    },
+    "osDiskSizeGB": {
+      "type": "int",
+      "defaultValue": 150,
+      "minValue": 100,
+      "maxValue": 1023,
+      "metadata": {
+        "description": "OS disk size in GB for the build VM. 150 GB covers Windows Server 2022 + runner-images tool set (VS, SDKs, browsers) with margin."
+      }
+    },
+    "runnerImagesCommit": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Commit SHA of actions/runner-images to check out for the bake. MUST be a full 40-character SHA — no branches, tags, or short SHAs — so the image is reproducible. The deploy pipeline / Dependabot bumps this; there is no safe default, so builds will fail fast if left empty."
+      }
+    },
+    "bakeTimestamp": {
+      "type": "string",
+      "defaultValue": "[utcNow('yyyyMMdd.HHmm')]",
+      "metadata": {
+        "description": "Timestamp captured once at deploy time for artifact tagging. Format: yyyyMMdd.HHmm. Do not override — default computes at deployment."
+      }
+    }
+  },
+  "variables": {
+    "runnerImagesRepo": "https://github.com/actions/runner-images.git",
+    "runOutputName": "ws2022",
+    "installRunnerImagesScript": "$ErrorActionPreference = 'Stop'\r\nif ([string]::IsNullOrWhiteSpace($env:RUNNER_IMAGES_COMMIT)) {\r\n  throw 'runnerImagesCommit parameter must be set to a full 40-char SHA'\r\n}\r\n$ProgressPreference = 'SilentlyContinue'\r\n[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\r\n# git-for-windows is not on the base image; install via chocolatey bootstrap\r\nSet-ExecutionPolicy Bypass -Scope Process -Force\r\nInvoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))\r\nchoco install -y --no-progress git\r\n$env:PATH = \"C:\\Program Files\\Git\\cmd;$env:PATH\"\r\n$repoPath = 'C:\\runner-images'\r\ngit clone --no-checkout $env:RUNNER_IMAGES_REPO $repoPath\r\nSet-Location $repoPath\r\ngit -c advice.detachedHead=false checkout $env:RUNNER_IMAGES_COMMIT\r\n$imageFolder = Join-Path $repoPath 'images\\windows'\r\n$env:IMAGE_FOLDER = $imageFolder\r\n$env:INSTALLER_SCRIPT_FOLDER = Join-Path $imageFolder 'scripts\\build'\r\n$env:HELPER_SCRIPTS = Join-Path $imageFolder 'scripts\\helpers'\r\n$env:AGENT_TOOLSDIRECTORY = 'C:\\hostedtoolcache\\windows'\r\nNew-Item -ItemType Directory -Force -Path $env:AGENT_TOOLSDIRECTORY | Out-Null\r\nGet-ChildItem -Path $env:INSTALLER_SCRIPT_FOLDER -Filter '*.ps1' | Sort-Object Name | ForEach-Object {\r\n  Write-Host \"=== running $($_.FullName) ===\"\r\n  & $_.FullName\r\n  if ($LASTEXITCODE -ne 0) { throw \"Script $($_.Name) failed with exit code $LASTEXITCODE\" }\r\n}\r\n",
+    "preRunnerBinaryScript": "$ErrorActionPreference = 'Stop'\r\n$markerDir = 'C:\\actions-runner'\r\nNew-Item -ItemType Directory -Force -Path $markerDir | Out-Null\r\n$marker = Join-Path $markerDir 'actions-runner-version.txt'\r\n@(\r\n  \"runner-images-commit=$($env:RUNNER_IMAGES_COMMIT)\",\r\n  \"bake-timestamp=$($env:BAKE_TIMESTAMP)\"\r\n) | Set-Content -Path $marker -Encoding ASCII\r\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.VirtualMachineImages/imageTemplates",
+      "apiVersion": "2024-02-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', parameters('buildIdentityId'))]": {}
+        }
+      },
+      "properties": {
+        "buildTimeoutInMinutes": "[parameters('buildTimeoutMinutes')]",
+        "vmProfile": {
+          "vmSize": "[parameters('vmSize')]",
+          "osDiskSizeGB": "[parameters('osDiskSizeGB')]"
+        },
+        "stagingResourceGroup": "[parameters('stagingResourceGroup')]",
+        "source": {
+          "type": "PlatformImage",
+          "publisher": "MicrosoftWindowsServer",
+          "offer": "WindowsServer",
+          "sku": "2022-datacenter-azure-edition",
+          "version": "latest"
+        },
+        "customize": [
+          {
+            "type": "PowerShell",
+            "name": "install-runner-images-tools",
+            "runElevated": true,
+            "runAsSystem": true,
+            "inline": [
+              "[format('$env:RUNNER_IMAGES_REPO = \"{0}\"', variables('runnerImagesRepo'))]",
+              "[format('$env:RUNNER_IMAGES_COMMIT = \"{0}\"', parameters('runnerImagesCommit'))]",
+              "[variables('installRunnerImagesScript')]"
+            ]
+          },
+          {
+            "type": "PowerShell",
+            "name": "pre-pull-runner-binary",
+            "runElevated": true,
+            "runAsSystem": true,
+            "inline": [
+              "[format('$env:RUNNER_IMAGES_COMMIT = \"{0}\"', parameters('runnerImagesCommit'))]",
+              "[format('$env:BAKE_TIMESTAMP = \"{0}\"', parameters('bakeTimestamp'))]",
+              "[variables('preRunnerBinaryScript')]"
+            ]
+          }
+        ],
+        "distribute": [
+          {
+            "type": "SharedImage",
+            "galleryImageId": "[parameters('imageDefinitionId')]",
+            "runOutputName": "[variables('runOutputName')]",
+            "replicationRegions": [
+              "[parameters('location')]"
+            ],
+            "excludeFromLatest": false,
+            "artifactTags": {
+              "runnerImagesCommit": "[parameters('runnerImagesCommit')]",
+              "bakeTimestamp": "[parameters('bakeTimestamp')]",
+              "os": "windows-2022"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "imageTemplateId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.VirtualMachineImages/imageTemplates', parameters('name'))]"
+    },
+    "imageTemplateName": {
+      "type": "string",
+      "value": "[parameters('name')]"
+    }
+  }
+}
